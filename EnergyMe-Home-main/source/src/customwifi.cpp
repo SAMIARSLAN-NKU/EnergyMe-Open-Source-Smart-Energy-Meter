@@ -1,0 +1,1469 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Jibril Sharafi
+
+#include "customwifi.h"
+#include "taskprofiler.h"
+
+namespace CustomWifi
+{
+  static TaskHeartbeat _heartbeat;
+
+  // WiFi connection task variables
+  static TaskHandle_t _wifiTaskHandle = NULL;
+  
+  // Counters
+  static uint64_t _lastReconnectAttempt = 0;
+  static int32_t _reconnectAttempts = 0; // Increased every disconnection, reset on stable (few minutes) connection
+  static uint64_t _lastWifiConnectedMillis = 0; // Timestamp when WiFi was last fully connected (for lwIP stabilization)
+  static IPAddress _lastMdnsIp; // Last IP for which mDNS was initialized; used to skip rebuild when IP unchanged
+  static bool _mdnsInitialized = false;
+
+  // WiFi event notification values for task communication
+  static const uint32_t WIFI_EVENT_CONNECTED = 1;
+  static const uint32_t WIFI_EVENT_GOT_IP = 2;
+  static const uint32_t WIFI_EVENT_DISCONNECTED = 3;
+  static const uint32_t WIFI_EVENT_SHUTDOWN = 4;
+  static const uint32_t WIFI_EVENT_FORCE_RECONNECT = 5;
+  static const uint32_t WIFI_EVENT_NEW_CREDENTIALS = 6;
+
+  // Task state management
+  static bool _taskShouldRun = false;
+  static bool _eventsEnabled = false;
+  
+  // New credentials storage for async switching
+  // To be safe, we should create mutexes around these since they are accessed via a public method
+  // But since they are seldom written and read, we can avoid the complexity for now
+  static char _pendingSSID[WIFI_SSID_BUFFER_SIZE] = {0};
+  static char _pendingPassword[WIFI_PASSWORD_BUFFER_SIZE] = {0};
+  static bool _hasPendingCredentials = false;
+
+  // Diagnostic info for fallback portal
+  static char _lastAttemptedSSID[WIFI_SSID_BUFFER_SIZE] = {0};
+  static uint8_t _lastDisconnectReason = 0;
+  static char _lastDisconnectSSID[WIFI_SSID_BUFFER_SIZE] = {0};
+  static char _lastDisconnectBSSID[MAC_ADDRESS_BUFFER_SIZE] = {0};
+  static int8_t _lastDisconnectRSSI = 0;
+
+  // Network configuration (static IP)
+  static WifiConfiguration _configuration;
+  static SemaphoreHandle_t _configMutex = nullptr;
+
+  // Private helper functions
+  static void _onWiFiEvent(WiFiEvent_t event);
+  static void _onWiFiEventWithInfo(WiFiEvent_t event, WiFiEventInfo_t info);
+  static const char* _getDisconnectReasonString(uint8_t reason);
+  static void _wifiConnectionTask(void *parameter);
+  static void _setupWiFiManager(WiFiManager &wifiManager);
+  static void _setupDiagnosticEndpoint(WiFiManager &wifiManager);
+  static void _handleSuccessfulConnection();
+  static bool _setupMdns();
+  static void _cleanup();
+  static void _startWifiTask();
+  static void _stopWifiTask();
+  static bool _testConnectivity();
+  static void _forceReconnectInternal();
+  static bool _isPowerReset();
+  static void _sendOpenSourceTelemetry();
+  static void _resolveApPassword(char* out, size_t outSize);
+  static bool _telemetrySent = false; // Ensures telemetry is sent only once per boot
+
+  // Network configuration helpers
+  static void _loadConfiguration();
+  static void _saveConfigurationToPreferences(const WifiConfiguration &config);
+  static void _applyNetworkConfiguration();
+  static bool _validateJsonConfiguration(JsonDocument &jsonDocument, bool partial);
+  static bool _validateConfiguration(const WifiConfiguration &config);
+  static bool _isValidIpv4(const char* str, bool allowZero);
+  static void _serviceStaticIpHealth(bool internetReachable);
+  static uint8_t _getStaticBootFails();
+  static void _setStaticBootFails(uint8_t count);
+  // Static-IP health state, reset each boot. _staticIpApplied: the static IP was actually applied
+  // (not skipped by the backstop). _staticBackstopCleared: the boot-fail counter has been cleared
+  // this boot. _staticRecoveryResolved: DHCP auto-recovery has confirmed internet or already fired.
+  static bool _staticIpApplied = false;
+  static bool _staticBackstopCleared = false;
+  static bool _staticRecoveryResolved = false;
+  static uint8_t _staticInternetFailStreak = 0;
+
+  bool begin()
+  {
+    if (_wifiTaskHandle != NULL)
+    {
+      LOG_DEBUG("WiFi task is already running");
+      return true;
+    }
+
+    LOG_DEBUG("Starting WiFi...");
+
+    // This has to be before everything else to ensure the hostname is actually set
+    char hostname[WIFI_SSID_BUFFER_SIZE];
+    snprintf(hostname, sizeof(hostname), "%s-%s", WIFI_HOSTNAME_PREFIX, DEVICE_ID);
+    WiFi.setHostname(hostname); // Allow for easier identification in the router/network client list
+
+    // Configure WiFi for better authentication reliability
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    
+    // Set WiFi mode explicitly and disable power saving to prevent handshake issues
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false); // Disable WiFi sleep to prevent handshake timeouts
+
+    // Load persisted network configuration, applying defaults and writing them back to
+    // NVS on first boot (migration). Then apply the static IP before the connection
+    // attempt so it takes effect for the initial join.
+    _loadConfiguration();
+    _applyNetworkConfiguration();
+
+    // Start WiFi connection task
+    _startWifiTask();
+    
+    return _wifiTaskHandle != NULL;
+  }
+
+  void stop()
+  {
+    _stopWifiTask();
+
+    // Disconnect WiFi and clean up
+    if (WiFi.isConnected())
+    {
+      LOG_DEBUG("Disconnecting WiFi...");
+      WiFi.disconnect(true);
+      delay(1000); // Allow time for disconnection
+      _cleanup();
+    }
+  }
+
+  bool isFullyConnected(bool requireInternet) // NOTE: as this can be quite "heavy", use it only where actually needed 
+  {
+    // Check if WiFi is connected and has an IP address (it can happen that WiFi is connected but no IP assigned)
+    if (!WiFi.isConnected() || WiFi.localIP() == IPAddress(0, 0, 0, 0)) return false;
+
+    // Ensure lwIP network stack has had time to stabilize after connection
+    // This prevents DNS/UDP crashes when services try to connect too quickly
+    if (_lastWifiConnectedMillis > 0 && (millis64() - _lastWifiConnectedMillis) < WIFI_LWIP_STABILIZATION_DELAY) return false;
+
+    if (requireInternet) return _testConnectivity();
+    return true;
+  }
+
+  bool testConnectivity()
+  {
+    return _testConnectivity();
+  }
+
+  void forceReconnect()
+  {
+    if (_wifiTaskHandle != NULL) {
+      LOG_WARNING("Forcing WiFi reconnection...");
+      xTaskNotify(_wifiTaskHandle, WIFI_EVENT_FORCE_RECONNECT, eSetValueWithOverwrite);
+    } else {
+      LOG_WARNING("Cannot force reconnect - WiFi task not running");
+    }
+  }
+
+  static void _setupWiFiManager(WiFiManager& wifiManager)
+  {
+    LOG_DEBUG("Setting up the WiFiManager...");
+
+    // Check if this is a power reset - router likely rebooting
+    bool isPowerReset = _isPowerReset();
+    uint32_t connectTimeout = isPowerReset ? WIFI_CONNECT_TIMEOUT_POWER_RESET_SECONDS : WIFI_CONNECT_TIMEOUT_SECONDS;
+    
+    if (isPowerReset) {
+      LOG_INFO("Power reset detected - using extended WiFi timeout (%d seconds) to allow router to reboot", connectTimeout);
+    }
+
+    wifiManager.setConnectTimeout(connectTimeout);
+    wifiManager.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_SECONDS);
+    wifiManager.setConnectRetries(WIFI_INITIAL_MAX_RECONNECT_ATTEMPTS); // Let WiFiManager handle initial retries
+    
+    // Additional WiFi settings to improve handshake reliability
+    wifiManager.setCleanConnect(true);    // Clean previous connection attempts
+    wifiManager.setBreakAfterConfig(true); // Exit after successful config
+    wifiManager.setRemoveDuplicateAPs(true); // Remove duplicate AP entries
+
+        // Callback when portal starts
+    wifiManager.setAPCallback([](WiFiManager *wm) {
+                                LOG_INFO("WiFi configuration portal started: %s", wm->getConfigPortalSSID().c_str());
+                                Led::blinkBlueFast(Led::PRIO_MEDIUM);
+                              });
+
+    // Callback when config is saved
+    wifiManager.setSaveConfigCallback([]() {
+            LOG_INFO("WiFi credentials saved via portal - restarting...");
+            Led::setPattern(
+              LedPattern::BLINK_FAST,
+              Led::Colors::CYAN,
+              Led::PRIO_CRITICAL,
+              3000ULL
+            );
+            // Maybe with some smart management we could avoid the restart..
+            // But we know that a reboot always solves any issues, so we leave it here
+            // to ensure we start fresh
+            setRestartSystem("Restart after WiFi config save");
+          });
+
+    // Setup diagnostic endpoint for troubleshooting during fallback
+    _setupDiagnosticEndpoint(wifiManager);
+
+    LOG_DEBUG("WiFiManager set up");
+  }
+
+  // Helper function to safely append to diagnostic page buffer
+  static size_t _appendToPageBuffer(char* buffer, size_t bufferSize, size_t currentPos, const char* format, ...)
+  {
+    if (currentPos >= bufferSize) return currentPos; // Buffer full
+    
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer + currentPos, bufferSize - currentPos, format, args);
+    va_end(args);
+    
+    if (written < 0) return currentPos; // Error
+    return currentPos + written;
+  }
+
+  static void _setupDiagnosticEndpoint(WiFiManager& wifiManager)
+  {
+    // Add diagnostic endpoint accessible during config portal fallback
+    // This uses WiFiManager's synchronous WebServer (not AsyncWebServer)
+    // While we could add some other endpoints for meter data and what not,
+    // it is better to keep this simple and light, and only for debugging.
+    wifiManager.setWebServerCallback([&wifiManager]() {
+      wifiManager.server->on("/diagnostic", HTTP_GET, [&wifiManager]() {
+        // Allocate static buffer for diagnostic page (16KB should be sufficient)
+        const size_t PAGE_BUFFER_SIZE = 16384;
+        static char pageBuffer[PAGE_BUFFER_SIZE] = {0};
+        size_t pos = 0;
+        
+        // Helper macro for cleaner append calls
+        #define APPEND_PAGE(fmt, ...) pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, fmt, ##__VA_ARGS__)
+        #define APPEND_PAGE_LITERAL(str) pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, "%s", str)
+        
+        // HTML head and styles
+        APPEND_PAGE_LITERAL("<!DOCTYPE html><html><head>");
+        APPEND_PAGE_LITERAL("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+        APPEND_PAGE_LITERAL("<title>EnergyMe Diagnostic</title>");
+        APPEND_PAGE_LITERAL("<style>");
+        APPEND_PAGE_LITERAL("body{font-family:Verdana,sans-serif;margin:0;padding:20px;background:#f5f5f5;color:#333}");
+        APPEND_PAGE_LITERAL("h1{color:#1fa3ec;border-bottom:2px solid #1fa3ec;padding-bottom:10px;margin-top:0}");
+        APPEND_PAGE_LITERAL("h2{color:#1fa3ec;margin:10px 0}");
+        APPEND_PAGE_LITERAL(".section{background:#fff;padding:15px;margin:15px 0;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}");
+        APPEND_PAGE_LITERAL("pre{background:#1a1a2e;color:#eee;padding:10px;overflow-x:auto;font-size:11px;max-height:300px;overflow-y:auto;border-radius:4px;white-space:pre-wrap;word-wrap:break-word}");
+        APPEND_PAGE_LITERAL(".info{display:grid;grid-template-columns:1fr 1fr;gap:8px}");
+        APPEND_PAGE_LITERAL(".info-item{background:#f9f9f9;padding:8px;border-radius:4px;border:1px solid #eee}");
+        APPEND_PAGE_LITERAL(".label{color:#888;font-size:11px;text-transform:uppercase}.value{font-weight:bold;color:#1fa3ec;word-break:break-all}");
+        APPEND_PAGE_LITERAL("button{background:#1fa3ec;color:#fff;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:14px}");
+        APPEND_PAGE_LITERAL("button:hover{background:#0e7ac4}");
+        APPEND_PAGE_LITERAL(".warn{color:#d9534f}");
+        APPEND_PAGE_LITERAL("</style>");
+        APPEND_PAGE_LITERAL("<script>");
+        APPEND_PAGE_LITERAL("function downloadLogs(){");
+        APPEND_PAGE_LITERAL("const logs=document.getElementById('logs-content').innerText;");
+        APPEND_PAGE_LITERAL("const blob=new Blob([logs],{type:'text/plain'});");
+        APPEND_PAGE_LITERAL("const url=URL.createObjectURL(blob);");
+        APPEND_PAGE_LITERAL("const a=document.createElement('a');");
+        APPEND_PAGE_LITERAL("a.href=url;");
+        APPEND_PAGE_LITERAL("a.download='energyme_diagnostic_'+new Date().toISOString().slice(0,10)+'.log';");
+        APPEND_PAGE_LITERAL("document.body.appendChild(a);");
+        APPEND_PAGE_LITERAL("a.click();");
+        APPEND_PAGE_LITERAL("document.body.removeChild(a);");
+        APPEND_PAGE_LITERAL("URL.revokeObjectURL(url);");
+        APPEND_PAGE_LITERAL("}");
+        APPEND_PAGE_LITERAL("</script>");
+        APPEND_PAGE_LITERAL("</head><body>");
+        
+        APPEND_PAGE_LITERAL("<h1>&#128295; EnergyMe Diagnostic</h1>");
+        
+        // System Information Section
+        APPEND_PAGE_LITERAL("<div class='section'><h2>System Information</h2><div class='info'>");
+        
+        APPEND_PAGE("<div class='info-item'><div class='label'>Firmware</div><div class='value'>%s</div></div>", FIRMWARE_BUILD_VERSION);
+        APPEND_PAGE("<div class='info-item'><div class='label'>Sketch MD5</div><div class='value'>%s</div></div>", ESP.getSketchMD5().c_str());
+        APPEND_PAGE("<div class='info-item'><div class='label'>Build Time</div><div class='value'>%s %s</div></div>", FIRMWARE_BUILD_DATE, FIRMWARE_BUILD_TIME);
+        APPEND_PAGE("<div class='info-item'><div class='label'>Device ID</div><div class='value'>%s</div></div>", DEVICE_ID);
+        APPEND_PAGE("<div class='info-item'><div class='label'>Free Heap</div><div class='value'>%lu bytes</div></div>", ESP.getFreeHeap());
+        APPEND_PAGE("<div class='info-item'><div class='label'>Free PSRAM</div><div class='value'>%lu bytes</div></div>", ESP.getFreePsram());
+        
+        // Calculate uptime
+        uint64_t uptimeMs = millis64();
+        uint64_t uptimeSec = uptimeMs / 1000;
+        uint32_t hours = (uint32_t)(uptimeSec / 3600);
+        uint32_t minutes = (uint32_t)((uptimeSec % 3600) / 60);
+        uint32_t seconds = (uint32_t)(uptimeSec % 60);
+        APPEND_PAGE("<div class='info-item'><div class='label'>Uptime</div><div class='value'>%02lu:%02lu:%02lu</div></div>", hours, minutes, seconds);
+        APPEND_PAGE("<div class='info-item'><div class='label'>Last Reset Reason</div><div class='value'>%s</div></div>", getResetReasonString(esp_reset_reason()));
+        
+        APPEND_PAGE_LITERAL("</div></div>");
+        
+        // WiFi Information Section
+        APPEND_PAGE_LITERAL("<div class='section'><h2>WiFi Status</h2><div class='info'>");
+        APPEND_PAGE("<div class='info-item'><div class='label'>Connection Status</div><div class='value'>%s</div></div>", wifiManager.getWLStatusString());
+        APPEND_PAGE("<div class='info-item'><div class='label'>Saved SSID</div><div class='value'>%s</div></div>", wifiManager.getWiFiSSID(true).c_str());
+        APPEND_PAGE("<div class='info-item'><div class='label'>Last Attempted SSID</div><div class='value'>%s</div></div>", 
+                    (strlen(_lastAttemptedSSID) > 0) ? _lastAttemptedSSID : "(none)");
+        
+        // Disconnect reason with warning styling
+        if (_lastDisconnectReason != 0) {
+          APPEND_PAGE("<div class='info-item'><div class='label'>Disconnect Reason</div><div class='value'><span class='warn'>%d (%s)</span></div></div>",
+                      _lastDisconnectReason, _getDisconnectReasonString(_lastDisconnectReason));
+        } else {
+          APPEND_PAGE_LITERAL("<div class='info-item'><div class='label'>Disconnect Reason</div><div class='value'>(no disconnect recorded)</div></div>");
+        }
+        
+        APPEND_PAGE("<div class='info-item'><div class='label'>Disconnect SSID</div><div class='value'>%s</div></div>",
+                    (strlen(_lastDisconnectSSID) > 0) ? _lastDisconnectSSID : "(none)");
+        APPEND_PAGE("<div class='info-item'><div class='label'>Disconnect BSSID</div><div class='value'>%s</div></div>",
+                    (strlen(_lastDisconnectBSSID) > 0) ? _lastDisconnectBSSID : "(none)");
+        
+        if (_lastDisconnectReason != 0) {
+          APPEND_PAGE("<div class='info-item'><div class='label'>Disconnect RSSI</div><div class='value'>%d dBm</div></div>", _lastDisconnectRSSI);
+        } else {
+          APPEND_PAGE_LITERAL("<div class='info-item'><div class='label'>Disconnect RSSI</div><div class='value'>(none)</div></div>");
+        }
+        
+        // Device MAC address
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        APPEND_PAGE("<div class='info-item'><div class='label'>Device MAC</div><div class='value'>%02X:%02X:%02X:%02X:%02X:%02X</div></div>",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        
+        APPEND_PAGE_LITERAL("</div></div>");
+        
+        // Recent Logs Section
+        APPEND_PAGE_LITERAL("<div class='section'><h2>Recent Logs</h2>");
+        APPEND_PAGE_LITERAL("<div style='margin-bottom:10px'><button onclick='downloadLogs()'>Download Logs</button></div>");
+        APPEND_PAGE_LITERAL("<pre id='logs-content'>");
+        
+        if (LittleFS.exists(LOG_PATH)) {
+          File logFile = LittleFS.open(LOG_PATH, "r");
+          if (logFile) {
+            size_t fileSize = logFile.size();
+            // Read last 4KB of logs to avoid memory issues
+            const size_t maxLogSize = MAX_LOG_SIZE_DIAGNOSTIC_FALLBACK_PAGE;
+            if (fileSize > maxLogSize) {
+              logFile.seek(fileSize - maxLogSize);
+              // Skip to next newline to avoid partial line
+              uint32_t loops = 0;
+              while (logFile.available() && loops < MAX_LOOP_ITERATIONS * 10) { // Increase the limit since logs may be long
+                loops++;
+                if (logFile.read() == '\n') break;
+              }
+            }
+            while (logFile.available() && pos < PAGE_BUFFER_SIZE - 10) { // Leave margin for closing tags
+              int c = logFile.read();
+              if (c < 0) break; // EOF or error
+              // Escape HTML special characters
+              if (c == '<') {
+                pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, "%s", "&lt;");
+              } else if (c == '>') {
+                pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, "%s", "&gt;");
+              } else if (c == '&') {
+                pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, "%s", "&amp;");
+              } else if (c == '"') {
+                pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, "%s", "&quot;");
+              } else if (c == '\'') {
+                pos = _appendToPageBuffer(pageBuffer, PAGE_BUFFER_SIZE, pos, "%s", "&#39;");
+              } else {
+                pageBuffer[pos++] = static_cast<char>(c);
+              }
+            }
+            logFile.close();
+          } else {
+            APPEND_PAGE_LITERAL("(Could not open log file)");
+          }
+        } else {
+          APPEND_PAGE_LITERAL("(No log file found)");
+        }
+        
+        APPEND_PAGE_LITERAL("</pre></div>");
+        
+        // Navigation
+        APPEND_PAGE_LITERAL("<div style='text-align:center;margin-top:20px'>");
+        APPEND_PAGE_LITERAL("<a href='/'><button>&#8592; Back to WiFi Setup</button></a>");
+        APPEND_PAGE_LITERAL("</div>");
+        
+        APPEND_PAGE_LITERAL("</body></html>");
+        
+        #undef APPEND_PAGE
+        #undef APPEND_PAGE_LITERAL
+        
+        wifiManager.server->send(200, "text/html", pageBuffer);
+      });
+    });
+
+    // Add diagnostic button to the WiFiManager menu
+    const char* menu[] = {"wifi", "info", "custom", "sep", "update", "exit"};
+    wifiManager.setMenu(menu, 6);
+    wifiManager.setCustomMenuHTML("<form action='/diagnostic' method='get'><button type='submit'>&#128295; Diagnostic</button></form>");
+  }
+
+  static void _onWiFiEvent(WiFiEvent_t event)
+  {
+    // Safety check - only process events if we're supposed to be running
+    if (!_eventsEnabled || !_taskShouldRun) {
+      return;
+    }
+
+    // Additional safety check for task handle validity
+    if (_wifiTaskHandle == NULL) {
+      return;
+    }
+
+    // Here we cannot do ANYTHING to avoid issues. Only notify the task,
+    // which will handle all operations in a safe context.
+    switch (event)
+    {
+    case ARDUINO_EVENT_WIFI_STA_START:
+      // Station started - no action needed
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      // Defer logging to task
+      xTaskNotify(_wifiTaskHandle, WIFI_EVENT_CONNECTED, eSetValueWithOverwrite);
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      // Defer all operations to task - avoid any function calls that might log
+      xTaskNotify(_wifiTaskHandle, WIFI_EVENT_GOT_IP, eSetValueWithOverwrite);
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      // Notify task to handle fallback if needed
+      xTaskNotify(_wifiTaskHandle, WIFI_EVENT_DISCONNECTED, eSetValueWithOverwrite);
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE:
+      // Auth mode changed - no immediate action needed
+      break;
+
+    default:
+      // Forward unknown events to task for logging/debugging
+      xTaskNotify(_wifiTaskHandle, (uint32_t)event, eSetValueWithOverwrite);
+      break;
+    }
+  }
+
+  // Early event handler to capture disconnect reason during initial connection
+  // This runs BEFORE autoConnect so we can capture why connection failed
+  static void _onWiFiEventWithInfo(WiFiEvent_t event, WiFiEventInfo_t info)
+  {
+    // DO NOT USE ANY LOGGING HERE to avoid weird crashes (this is a callback.. I don't know why but it seems unsafe)
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      _lastDisconnectReason = info.wifi_sta_disconnected.reason;
+      _lastDisconnectRSSI = info.wifi_sta_disconnected.rssi;
+      snprintf(_lastDisconnectSSID, sizeof(_lastDisconnectSSID), "%s", info.wifi_sta_disconnected.ssid);
+      snprintf((char*)_lastDisconnectBSSID, sizeof(_lastDisconnectBSSID), "%02X:%02X:%02X:%02X:%02X:%02X",
+               info.wifi_sta_disconnected.bssid[0], info.wifi_sta_disconnected.bssid[1],
+               info.wifi_sta_disconnected.bssid[2], info.wifi_sta_disconnected.bssid[3],
+               info.wifi_sta_disconnected.bssid[4], info.wifi_sta_disconnected.bssid[5]);
+    }
+  }
+
+  static const char* _getDisconnectReasonString(uint8_t reason)
+  {
+    switch (reason) {
+      case 1:   return "UNSPECIFIED";
+      case 2:   return "AUTH_EXPIRE";
+      case 3:   return "AUTH_LEAVE";
+      case 4:   return "DISASSOC_INACTIVITY";
+      case 5:   return "ASSOC_TOOMANY";
+      case 6:   return "CLASS2_FRAME_NONAUTH";
+      case 7:   return "CLASS3_FRAME_NONASSOC";
+      case 8:   return "ASSOC_LEAVE";
+      case 9:   return "ASSOC_NOT_AUTHED";
+      case 10:  return "DISASSOC_PWRCAP_BAD";
+      case 11:  return "DISASSOC_SUPCHAN_BAD";
+      case 12:  return "BSS_TRANSITION";
+      case 13:  return "IE_INVALID";
+      case 14:  return "MIC_FAILURE";
+      case 15:  return "4WAY_HANDSHAKE_TIMEOUT";
+      case 16:  return "GROUP_KEY_UPDATE_TIMEOUT";
+      case 17:  return "IE_IN_4WAY_DIFFERS";
+      case 18:  return "GROUP_CIPHER_INVALID";
+      case 19:  return "PAIRWISE_CIPHER_INVALID";
+      case 20:  return "AKMP_INVALID";
+      case 21:  return "UNSUPP_RSN_IE_VERSION";
+      case 22:  return "INVALID_RSN_IE_CAP";
+      case 23:  return "802_1X_AUTH_FAILED";
+      case 24:  return "CIPHER_SUITE_REJECTED";
+      case 200: return "BEACON_TIMEOUT";
+      case 201: return "NO_AP_FOUND";
+      case 202: return "AUTH_FAIL";
+      case 203: return "ASSOC_FAIL";
+      case 204: return "HANDSHAKE_TIMEOUT";
+      case 205: return "CONNECTION_FAIL";
+      case 206: return "AP_TSF_RESET";
+      case 207: return "ROAMING";
+      case 208: return "ASSOC_COMEBACK_TIME_TOO_LONG";
+      case 209: return "SA_QUERY_TIMEOUT";
+      case 210: return "NO_AP_COMPATIBLE_SECURITY";
+      case 211: return "NO_AP_AUTHMODE_THRESHOLD";
+      case 212: return "NO_AP_RSSI_THRESHOLD";
+      default:  return "UNKNOWN";
+    }
+  }
+
+  static void _handleSuccessfulConnection()
+  {
+    _lastReconnectAttempt = 0;
+
+    _setupMdns();
+    // Note: printDeviceStatusDynamic() removed to avoid flash I/O from PSRAM task
+
+    Led::clearPattern(Led::PRIO_MEDIUM); // Ensure that if we are connected again, we don't keep the blue pattern
+    Led::setGreen(Led::PRIO_NORMAL); // Hack: to ensure we get back to green light, we set it here even though a proper LED manager would handle priorities better
+    LOG_INFO("WiFi fully connected and operational");
+
+    // Static-IP health (boot-fail backstop clear + DHCP auto-recovery) is serviced from the periodic
+    // check in the task loop, not here: it must run past the early crash window and after the restart
+    // gate's minimum uptime, and we never reconfigure the live netif (that races lwIP).
+
+    _sendOpenSourceTelemetry(); // Non-blocking short POST (guarded by compile-time flag)
+  }
+
+  static void _wifiConnectionTask(void *parameter)
+  {
+    LOG_DEBUG("WiFi task started");
+    uint32_t notificationValue;
+    _taskShouldRun = true;
+
+    // Create WiFiManager on heap to save stack space
+    WiFiManager* wifiManager = new WiFiManager();
+    if (!wifiManager) {
+      LOG_ERROR("Failed to allocate WiFiManager");
+      _taskShouldRun = false;
+      _cleanup();
+      _wifiTaskHandle = NULL;
+      vTaskDelete(NULL);
+      return;
+    }
+    _setupWiFiManager(*wifiManager);
+
+    // Initial connection attempt
+    Led::pulseBlue(Led::PRIO_MEDIUM);
+    char hostname[WIFI_SSID_BUFFER_SIZE];
+    snprintf(hostname, sizeof(hostname), "%s-%s", WIFI_CONFIG_PORTAL_SSID, DEVICE_ID);
+
+    // Store the saved SSID for diagnostic purposes before attempting connection
+    String savedSSID = wifiManager->getWiFiSSID(true);
+    if (savedSSID.length() > 0) {
+      snprintf(_lastAttemptedSSID, sizeof(_lastAttemptedSSID), "%s", savedSSID.c_str());
+    }
+
+    // Register early event handler to capture disconnect reason during initial connection
+    // This must be BEFORE autoConnect so we can capture why connection fails
+    WiFi.onEvent(_onWiFiEventWithInfo);
+
+    // Try initial connection with retries for handshake timeouts
+    LOG_DEBUG("Attempt WiFi connection");
+
+    // If we don't manage to connect with WiFi Manager and the credentials are not provided, we might as well just restart.
+    // In the future, we could allow for full-offline functionality, but for now, we keep it simple.
+    // TODO: implement a full custom WiFi manager for better UX
+    char apPassword[WIFI_PASSWORD_BUFFER_SIZE];
+    _resolveApPassword(apPassword, sizeof(apPassword));
+    if (!wifiManager->autoConnect(hostname, apPassword)) {
+      LOG_WARNING("WiFi connection failed, exiting wifi task");
+      Led::blinkRedFast(Led::PRIO_URGENT);
+      _taskShouldRun = false;
+      setRestartSystem("Restart after WiFi connection failure");
+      _cleanup();
+      delete wifiManager; // Clean up before exit
+      _wifiTaskHandle = NULL;
+      vTaskDelete(NULL);
+      return;
+    }
+
+    // Clean up WiFiManager after successful connection - no longer needed
+    delete wifiManager;
+    wifiManager = nullptr;
+
+    Led::clearPattern(Led::PRIO_MEDIUM);
+    
+    // If we reach here, we are connected
+    _handleSuccessfulConnection();
+
+    // Setup WiFi event handling - Only after full connection as during setup would crash sometimes probably due to the notifications
+    _eventsEnabled = true;
+    WiFi.onEvent(_onWiFiEvent);
+
+    // Main task loop - handles fallback scenarios and deferred logging
+    while (_taskShouldRun)
+    {
+      TASK_HEARTBEAT(_heartbeat);
+
+      // Wait for notification from event handler or timeout
+      if (xTaskNotifyWait(0, ULONG_MAX, &notificationValue, pdMS_TO_TICKS(WIFI_PERIODIC_CHECK_INTERVAL)))
+      {
+        // Check if this is a stop notification (we use a special value for shutdown)
+        if (notificationValue == WIFI_EVENT_SHUTDOWN)
+        {
+          _taskShouldRun = false;
+          break;
+        }
+
+        // Handle deferred operations from WiFi events (safe context)
+        switch (notificationValue)
+        {
+        case WIFI_EVENT_CONNECTED:
+          LOG_DEBUG("WiFi connected to: %s", WiFi.SSID().c_str());
+          continue; // No further action needed
+
+        case WIFI_EVENT_GOT_IP:
+          LOG_DEBUG("WiFi got IP: %s", WiFi.localIP().toString().c_str());
+          statistics.wifiConnection++; // It is here we know the wifi connection went through (and the one which is called on reconnections)
+          _lastWifiConnectedMillis = millis64(); // Track connection time for lwIP stabilization
+          // Handle successful connection operations safely in task context
+          _handleSuccessfulConnection();
+          continue; // No further action needed
+
+        case WIFI_EVENT_FORCE_RECONNECT:
+          _forceReconnectInternal();
+          continue; // No further action needed
+
+        case WIFI_EVENT_NEW_CREDENTIALS:
+          if (_hasPendingCredentials)
+          {
+            LOG_INFO("Processing new WiFi credentials for SSID: %s", _pendingSSID);
+            
+            // Save new credentials to NVS using esp_wifi_set_config() directly
+            // This stores credentials WITHOUT triggering a connection attempt,
+            // which avoids heap corruption when restarting immediately after
+            wifi_config_t wifi_config = {};
+            snprintf((char*)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", _pendingSSID);
+            snprintf((char*)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", _pendingPassword);
+            
+            esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+            if (err != ESP_OK) {
+              LOG_ERROR("Failed to save WiFi credentials: %s", esp_err_to_name(err));
+              memset(_pendingSSID, 0, sizeof(_pendingSSID));
+              memset(_pendingPassword, 0, sizeof(_pendingPassword));
+              _hasPendingCredentials = false;
+              continue;
+            }
+            
+            // Clear pending credentials from memory
+            memset(_pendingSSID, 0, sizeof(_pendingSSID));
+            memset(_pendingPassword, 0, sizeof(_pendingPassword));
+            _hasPendingCredentials = false;
+            
+            // Request system restart to apply new WiFi credentials
+            LOG_INFO("New credentials saved to NVS, restarting system");
+            setRestartSystem("Restart to apply new WiFi credentials");
+          }
+          continue; // No further action needed
+
+        case WIFI_EVENT_DISCONNECTED:
+          statistics.wifiConnectionError++;
+          Led::pulseBlue(Led::PRIO_MEDIUM);
+          LOG_WARNING("WiFi disconnected - auto-reconnect will handle");
+          _lastWifiConnectedMillis = 0; // Reset stabilization timer on disconnect
+
+          // Wait a bit for auto-reconnect (enabled by default) to work
+          delay(WIFI_DISCONNECT_DELAY);
+
+          // Check if still disconnected
+          if (!isFullyConnected())
+          {
+            _reconnectAttempts++;
+            _lastReconnectAttempt = millis64();
+
+            LOG_WARNING("Auto-reconnect failed, attempt %d", _reconnectAttempts);
+
+            // After several failures, try WiFiManager as fallback
+            if (_reconnectAttempts >= WIFI_MAX_CONSECUTIVE_RECONNECT_ATTEMPTS)
+            {
+              LOG_ERROR("Multiple reconnection failures - starting portal");
+
+              // Create WiFiManager on heap for portal operation
+              WiFiManager* portalManager = new WiFiManager();
+              if (!portalManager) {
+                LOG_ERROR("Failed to allocate WiFiManager for portal");
+                setRestartSystem("Restart after WiFiManager allocation failure");
+                break;
+              }
+              _setupWiFiManager(*portalManager);
+
+              // Try WiFiManager portal (WPA2-protected; password from factory NVS or MAC fallback)
+              char fallbackApPassword[WIFI_PASSWORD_BUFFER_SIZE];
+              _resolveApPassword(fallbackApPassword, sizeof(fallbackApPassword));
+              if (!portalManager->startConfigPortal(hostname, fallbackApPassword))
+              {
+                LOG_ERROR("Portal failed - restarting device");
+                Led::blinkRedFast(Led::PRIO_URGENT);
+                setRestartSystem("Restart after portal failure");
+              }
+
+              // Clean up WiFiManager after portal operation
+              delete portalManager;
+              // If portal succeeds, device will restart automatically
+            }
+          }
+          break;
+
+        default:
+          // Handle unknown WiFi events for debugging
+          if (notificationValue >= 100) { // WiFi events are >= 100
+            LOG_DEBUG("Unknown WiFi event received: %lu", notificationValue);
+          } else {
+            // Legacy notification or timeout - treat as disconnection check
+            LOG_DEBUG("WiFi periodic check or timeout");
+          }
+          break;
+        }
+      }
+      else
+      {
+        // Timeout occurred - perform periodic health check
+        if (_taskShouldRun)
+        {
+          if (isFullyConnected())
+          {
+            // Test internet connectivity but don't force reconnection if it fails
+            // WiFi is connected to local network - internet may simply be unavailable
+            // This allows the device to operate in local-only mode (static IP, isolated networks)
+            bool internetReachable = _testConnectivity();
+            if (!internetReachable) {
+              LOG_DEBUG("Internet connectivity unavailable - device operating in local-only mode");
+            }
+
+            // Manage the static-IP safety nets (backstop clear + DHCP auto-recovery)
+            _serviceStaticIpHealth(internetReachable);
+
+            // Reset failure counter on sustained connection
+            if (_reconnectAttempts > 0 && millis64() - _lastReconnectAttempt > WIFI_STABLE_CONNECTION_DURATION)
+            {
+              LOG_DEBUG("WiFi connection stable - resetting counters");
+              _reconnectAttempts = 0;
+            }
+          }
+          else
+          {
+            // WiFi not connected or no IP - force reconnection
+            LOG_WARNING("Periodic check: WiFi not fully connected - forcing reconnection");
+            _forceReconnectInternal();
+          }
+        }
+      }
+    }
+
+    // Cleanup before task exit
+    _cleanup();
+    
+    LOG_DEBUG("WiFi task stopping");
+    _wifiTaskHandle = NULL;
+    vTaskDelete(NULL);
+  }
+
+  void resetWifi()
+  {
+    LOG_INFO("Resetting WiFi credentials and restarting...");
+    Led::blinkOrangeFast(Led::PRIO_CRITICAL);
+
+    // Also revert the network configuration (static IP) to defaults.
+    // A WiFi reset is the connectivity-recovery path, so it must give a clean DHCP slate -
+    // otherwise a bad static IP would survive the credential reset and keep the device
+    // unreachable even after reconfiguring WiFi through the portal.
+    resetConfiguration();
+
+    // Create WiFiManager on heap temporarily to reset settings
+    WiFiManager* wifiManager = new WiFiManager();
+    if (wifiManager) {
+      wifiManager->resetSettings();
+      delete wifiManager;
+    }
+
+    setRestartSystem("Restart after WiFi reset");
+  }
+
+  bool setCredentials(const char* ssid, const char* password)
+  {
+    // Validate inputs
+    if (!ssid || !isStringLengthValid(ssid, 1, WIFI_SSID_BUFFER_SIZE - 1))
+    {
+      LOG_ERROR("Invalid SSID provided (must be 1-31 characters)");
+      return false;
+    }
+
+    if (!password)
+    {
+      LOG_ERROR("Password cannot be NULL");
+      return false;
+    }
+
+    if (!isStringLengthValid(password, 0, WIFI_PASSWORD_BUFFER_SIZE - 1))
+    {
+      LOG_ERROR("Password exceeds maximum length of %d characters", WIFI_PASSWORD_BUFFER_SIZE - 1);
+      return false;
+    }
+
+    if (strlen(password) == 0)
+    {
+      LOG_WARNING("Empty password provided for SSID: %s (open network)", ssid);
+    }
+
+    // Check if WiFi task is running
+    if (_wifiTaskHandle == NULL)
+    {
+      LOG_ERROR("Cannot set credentials - WiFi task not running");
+      return false;
+    }
+
+    LOG_INFO("Queueing new WiFi credentials for SSID: %s", ssid);
+    
+    // Store credentials for WiFi task to process
+    snprintf(_pendingSSID, sizeof(_pendingSSID), "%s", ssid);
+    snprintf(_pendingPassword, sizeof(_pendingPassword), "%s", password);
+    _hasPendingCredentials = true;
+    
+    // Notify WiFi task to process new credentials
+    xTaskNotify(_wifiTaskHandle, WIFI_EVENT_NEW_CREDENTIALS, eSetValueWithOverwrite);
+    
+    // Return immediately - actual connection happens asynchronously in WiFi task
+    // This prevents blocking the web server and avoids conflicts with event handlers
+    return true;
+  }
+
+  bool _setupMdns()
+  {
+    // Skip rebuild if responder is already running for the current IP. ESP-IDF mDNS
+    // does periodic unsolicited re-announces (~120 s, RFC 6762) on its own, so peers
+    // stay aware as long as the responder is alive. Most WiFi reconnects keep the
+    // same DHCP lease; only rebuild when the IP actually changed.
+    IPAddress currentIp = WiFi.localIP();
+    if (_mdnsInitialized && currentIp == _lastMdnsIp) {
+      LOG_DEBUG("mDNS already running for %s, skipping rebuild", currentIp.toString().c_str());
+      return true;
+    }
+
+    LOG_DEBUG("Setting up mDNS...");
+
+    // Ensure mDNS is stopped before starting
+    if (_mdnsInitialized) {
+      MDNS.end();
+      delay(100);
+    }
+
+    // I would like to check for same MDNS_HOSTNAME on the newtork, but it seems that
+    // I cannot do this with consistency. Let's just start the mDNS on the network and
+    // hope for no other devices with the same name.
+
+    if (MDNS.begin(MDNS_HOSTNAME) &&
+        MDNS.addService("http", "tcp", WEBSERVER_PORT) &&
+        MDNS.addService("modbus", "tcp", MODBUS_TCP_PORT))
+    {
+      // Add standard service discovery information
+      MDNS.addServiceTxt("http", "tcp", "device_id", static_cast<const char *>(DEVICE_ID));
+      MDNS.addServiceTxt("http", "tcp", "vendor", COMPANY_NAME);
+      MDNS.addServiceTxt("http", "tcp", "model", PRODUCT_NAME);
+      MDNS.addServiceTxt("http", "tcp", "version", FIRMWARE_BUILD_VERSION);
+      MDNS.addServiceTxt("http", "tcp", "path", "/");
+      MDNS.addServiceTxt("http", "tcp", "auth", "required");
+      MDNS.addServiceTxt("http", "tcp", "ssl", "false");
+      
+      // Modbus service information
+      MDNS.addServiceTxt("modbus", "tcp", "device_id", static_cast<const char *>(DEVICE_ID));
+      MDNS.addServiceTxt("modbus", "tcp", "vendor", COMPANY_NAME);
+      MDNS.addServiceTxt("modbus", "tcp", "model", PRODUCT_NAME);
+      MDNS.addServiceTxt("modbus", "tcp", "version", FIRMWARE_BUILD_VERSION);
+      MDNS.addServiceTxt("modbus", "tcp", "channels", "16"); // Cannot use constant since that is a number, not a string
+
+      _lastMdnsIp = currentIp;
+      _mdnsInitialized = true;
+      LOG_INFO("mDNS setup done: %s.local", MDNS_HOSTNAME);
+      return true;
+    }
+    else
+    {
+      LOG_WARNING("Error setting up mDNS");
+      return false;
+    }
+  }
+
+  static void _cleanup()
+  {
+    LOG_DEBUG("Cleaning up WiFi resources...");
+    
+    // Disable event handling first
+    _eventsEnabled = false;
+    
+    // Remove WiFi event handler to prevent crashes during shutdown
+    WiFi.removeEvent(_onWiFiEvent);
+    
+    // Stop mDNS
+    MDNS.end();
+    _mdnsInitialized = false;
+    _lastMdnsIp = IPAddress();
+
+    LOG_DEBUG("WiFi cleanup completed");
+  }
+
+  static bool _testConnectivity()
+  {
+    // Check basic WiFi connectivity (without internet test to avoid recursion)
+    if (!WiFi.isConnected() || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+      LOG_WARNING("Connectivity test failed early: WiFi not connected");
+      return false;
+    }
+
+    // Check if we have a valid gateway IP
+    IPAddress gateway = WiFi.gatewayIP();
+    if (gateway == IPAddress(0, 0, 0, 0)) {
+      LOG_WARNING("Connectivity test failed: no gateway IP available");
+      statistics.wifiConnectionError++;
+      return false;
+    }
+
+    // Check if we have valid DNS servers
+    // This should be true even before DNS resolution
+    IPAddress dns1 = WiFi.dnsIP(0);
+    IPAddress dns2 = WiFi.dnsIP(1);
+    if (dns1 == IPAddress(0, 0, 0, 0) && dns2 == IPAddress(0, 0, 0, 0)) {
+      LOG_WARNING("Connectivity test failed: no DNS servers available");
+      statistics.wifiConnectionError++;
+      return false;
+    }
+
+    // Simple TCP connect to Google Public DNS (8.8.8.8:53) - lightweight internet connectivity test
+    // Uses IP address to avoid DNS lookup, port 53 is rarely blocked by firewalls
+    WiFiClient client;
+    client.setTimeout(CONNECTIVITY_TEST_TIMEOUT_MS);
+    
+    if (!client.connect(CONNECTIVITY_TEST_IP, CONNECTIVITY_TEST_PORT)) {
+      // Here we only log a debug since the internet connectivity is not a must-have
+      // While before we used LOG_WARNING since the issue is WiFi related (critical)
+      LOG_DEBUG("Connectivity test failed: cannot reach %s:%d (no internet)", 
+                  CONNECTIVITY_TEST_IP, CONNECTIVITY_TEST_PORT);
+      return false;
+    }
+    
+    // Connection successful - internet is reachable
+    client.stop();
+    
+    // Use char buffers to avoid dynamic string allocation in logs and potential crashes
+    char gatewayStr[IP_ADDRESS_BUFFER_SIZE];
+    snprintf(gatewayStr, sizeof(gatewayStr), "%d.%d.%d.%d", gateway[0], gateway[1], gateway[2], gateway[3]);
+    char dns1Str[IP_ADDRESS_BUFFER_SIZE];
+    snprintf(dns1Str, sizeof(dns1Str), "%d.%d.%d.%d", dns1[0], dns1[1], dns1[2], dns1[3]);
+    LOG_DEBUG("Connectivity test passed - Gateway: %s, DNS: %s, Internet: %s:%d reachable", 
+              gatewayStr,
+              dns1Str,
+              CONNECTIVITY_TEST_IP,
+              CONNECTIVITY_TEST_PORT);
+    return true;
+  }
+
+  static void _forceReconnectInternal()
+  {
+    LOG_WARNING("Performing forced WiFi reconnection...");
+    
+    // Disconnect and reconnect
+    WiFi.disconnect(false); // Don't erase credentials
+    delay(WIFI_FORCE_RECONNECT_DELAY);
+    
+    // Trigger reconnection
+    WiFi.reconnect();
+    
+    _reconnectAttempts++;
+    _lastReconnectAttempt = millis64();
+    statistics.wifiConnectionError++;
+    
+    LOG_INFO("Forced reconnection initiated (attempt %d)", _reconnectAttempts);
+  }
+
+  static bool _isPowerReset()
+  {
+    // Check if the reset reason indicates a power-related event
+    // ESP_RST_POWERON: Power on reset (cold boot)
+    // ESP_RST_BROWNOUT: Brownout reset (power supply voltage dropped below minimum)
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    return resetReason == ESP_RST_POWERON || resetReason == ESP_RST_BROWNOUT;
+  }
+
+  // Load the SoftAP password used by the WiFi config portal. Prefers the factory-provisioned
+  // value (NVS factory_ns::ap_password); falls back to DEVICE_ID, which is already part of
+  // the portal SSID so users connecting to the AP can read it off the network name.
+  // DEVICE_ID is 12 hex chars, which satisfies WPA2's 8-character minimum.
+  static void _resolveApPassword(char* out, size_t outSize)
+  {
+    if (out == nullptr || outSize == 0) return;
+    out[0] = '\0';
+
+    Preferences prefs;
+    if (prefs.begin(PREFERENCES_NAMESPACE_FACTORY, true)) {
+      prefs.getString(FACTORY_KEY_AP_PASSWORD, out, outSize);
+      prefs.end();
+    }
+
+    if (strlen(out) < 8) {
+      snprintf(out, outSize, "%s", DEVICE_ID);
+    }
+  }
+
+  static void _sendOpenSourceTelemetry()
+  {
+#ifdef ENABLE_OPEN_SOURCE_TELEMETRY
+    if (_telemetrySent) return;
+
+    // Basic preconditions: WiFi connected with IP
+    if (!isFullyConnected(true)) {
+      LOG_DEBUG("Skipping telemetry - WiFi not fully connected");
+      return;
+    }
+
+    // Prepare JSON payload using PSRAM allocator
+    SpiRamAllocator allocator;
+    JsonDocument doc(&allocator);
+
+    // Hash the device identifier (privacy: avoid sending raw ID)
+    unsigned char hash[32];
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, reinterpret_cast<const unsigned char*>(DEVICE_ID), strlen((const char*)DEVICE_ID));
+    mbedtls_sha256_finish(&sha, hash);
+    mbedtls_sha256_free(&sha);
+    
+    char hashedDeviceId[65]; // 64 hex chars + null
+    for (int i = 0; i < 32; i++) snprintf(&hashedDeviceId[i * 2], 3, "%02x", hash[i]);
+    
+    doc["hashed_device_id"] = hashedDeviceId; // Replace plain ID with hashed value
+    doc["firmware_version"] = FIRMWARE_BUILD_VERSION;
+    doc["sketch_md5"] = ESP.getSketchMD5();
+
+    char jsonBuffer[TELEMETRY_JSON_BUFFER_SIZE];
+    size_t jsonSize = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+    if (jsonSize == 0 || jsonSize >= sizeof(jsonBuffer)) {
+      LOG_WARNING("Telemetry JSON invalid or too large"); 
+      return; 
+    }
+
+    WiFiClientSecure client;
+    client.setTimeout(TELEMETRY_TIMEOUT_MS);
+    client.setCACert(AWS_IOT_CORE_CA_CERT); // Use Amazon Root CA 1 for secure connection
+
+    if (!client.connect(TELEMETRY_URL, TELEMETRY_PORT)) {
+      LOG_WARNING("Telemetry connection failed");
+      return;
+    }
+
+    // Build HTTP request headers
+    char header[TELEMETRY_JSON_BUFFER_SIZE];
+    int headerLen = snprintf(header, sizeof(header),
+                             "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: EnergyMe-Home/%s\r\nContent-Type: application/json\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                             TELEMETRY_PATH,
+                             TELEMETRY_URL,
+                             FIRMWARE_BUILD_VERSION,
+                             (unsigned)jsonSize);
+    if (headerLen <= 0 || headerLen >= (int)sizeof(header)) {
+      client.stop(); 
+      LOG_WARNING("Telemetry header build failed"); 
+      return; 
+    }
+
+    // Send request
+    client.write(reinterpret_cast<const uint8_t*>(header), headerLen);
+    client.write(reinterpret_cast<const uint8_t*>(jsonBuffer), jsonSize);
+
+    // Lightweight response handling (discard data, avoid dynamic allocations)
+    // While we could avoid this, it is safer to ensure the server closes the connection properly
+    uint64_t start = millis64();
+    while (client.connected() && (millis64() - start) < TELEMETRY_TIMEOUT_MS)
+    {
+      while (client.available()) client.read();
+      delay(10);
+    }
+    client.stop();
+
+    _telemetrySent = true; // Set to true regardless of success to avoid repeated attempts. This info is not critical.
+    LOG_INFO("Open source telemetry sent");
+#else
+    LOG_DEBUG("Open source telemetry disabled (compile-time)");
+#endif
+  }
+
+  static void _startWifiTask()
+  {
+    if (_wifiTaskHandle) { LOG_DEBUG("WiFi task is already running"); return; }
+    LOG_DEBUG("Starting WiFi task with %d bytes stack in internal RAM (performs TCP network operations)", WIFI_TASK_STACK_SIZE);
+
+    BaseType_t result = xTaskCreate(
+        _wifiConnectionTask,
+        WIFI_TASK_NAME,
+        WIFI_TASK_STACK_SIZE,
+        nullptr,
+        WIFI_TASK_PRIORITY,
+        &_wifiTaskHandle);
+    if (result != pdPASS) { LOG_ERROR("Failed to create WiFi task"); }
+  }
+
+  static void _stopWifiTask()
+  {
+    if (_wifiTaskHandle == NULL)
+    {
+      LOG_DEBUG("WiFi task was not running");
+      return;
+    }
+
+    LOG_DEBUG("Stopping WiFi task");
+
+    // Send shutdown notification using the special shutdown event (cannot use standard stopTaskGracefully)
+    xTaskNotify(_wifiTaskHandle, WIFI_EVENT_SHUTDOWN, eSetValueWithOverwrite);
+
+    // Wait with timeout for clean shutdown using standard pattern
+    uint64_t startTime = millis64();
+    
+    while (_wifiTaskHandle != NULL && (millis64() - startTime) < TASK_STOPPING_TIMEOUT)
+    {
+      delay(TASK_STOPPING_CHECK_INTERVAL);
+    }
+
+    // Force cleanup if needed
+    if (_wifiTaskHandle != NULL)
+    {
+      LOG_WARNING("Force stopping WiFi task after timeout");
+      vTaskDelete(_wifiTaskHandle);
+      _wifiTaskHandle = NULL;
+    }
+    else
+    {
+      LOG_DEBUG("WiFi task stopped gracefully");
+    }
+
+    WiFi.disconnect(true);
+  }
+
+  // ============================================================================
+  // Network configuration (static IP)
+  // ============================================================================
+
+  static bool _isValidIpv4(const char* str, bool allowZero)
+  {
+    if (str == nullptr || str[0] == '\0') return false;
+    IPAddress addr;
+    if (!addr.fromString(str)) return false;
+    if (!allowZero && addr == IPAddress(0, 0, 0, 0)) return false;
+    return true;
+  }
+
+  bool getConfiguration(WifiConfiguration &config)
+  {
+    if (!acquireMutex(&_configMutex)) {
+      LOG_ERROR("Failed to acquire configuration mutex for getConfiguration");
+      return false;
+    }
+    config = _configuration;
+    releaseMutex(&_configMutex);
+    return true;
+  }
+
+  bool setConfiguration(const WifiConfiguration &config)
+  {
+    if (!_validateConfiguration(config)) {
+      LOG_WARNING("Refusing to set invalid network configuration");
+      return false;
+    }
+
+    if (!createMutexIfNeeded(&_configMutex)) return false;
+    if (!acquireMutex(&_configMutex)) {
+      LOG_ERROR("Failed to acquire configuration mutex for setConfiguration");
+      return false;
+    }
+    _configuration = config;
+    releaseMutex(&_configMutex);
+
+    // NVS write runs unlocked - copy was already taken under the mutex
+    _saveConfigurationToPreferences(config);
+
+    LOG_DEBUG("Network configuration set");
+    return true;
+  }
+
+  bool resetConfiguration()
+  {
+    LOG_DEBUG("Resetting network configuration to default");
+    WifiConfiguration defaultConfig;
+    if (!setConfiguration(defaultConfig)) {
+      LOG_ERROR("Failed to reset network configuration");
+      return false;
+    }
+    _setStaticBootFails(0); // Clean slate - default config is DHCP anyway
+    LOG_INFO("Network configuration reset to default");
+    return true;
+  }
+
+  bool getConfigurationAsJson(JsonDocument &jsonDocument)
+  {
+    WifiConfiguration config;
+    if (!getConfiguration(config)) return false;
+    configurationToJson(config, jsonDocument);
+    return true;
+  }
+
+  bool setConfigurationFromJson(JsonDocument &jsonDocument, bool partial)
+  {
+    WifiConfiguration config;
+    getConfiguration(config);
+
+    if (!configurationFromJson(jsonDocument, config, partial)) {
+      LOG_ERROR("Failed to set network configuration from JSON");
+      return false;
+    }
+
+    if (!setConfiguration(config)) return false;
+
+    // A user-saved config is the escape hatch: give the (possibly new) static IP a fresh set of
+    // boot attempts so the backstop doesn't keep it disabled from previous failures.
+    _setStaticBootFails(0);
+    return true;
+  }
+
+  void configurationToJson(const WifiConfiguration &config, JsonDocument &jsonDocument)
+  {
+    jsonDocument["useStaticIp"] = config.useStaticIp;
+    jsonDocument["ip"] = JsonString(config.ip);
+    jsonDocument["gateway"] = JsonString(config.gateway);
+    jsonDocument["subnet"] = JsonString(config.subnet);
+    jsonDocument["dns1"] = JsonString(config.dns1);
+    jsonDocument["dns2"] = JsonString(config.dns2);
+    jsonDocument["fallbackToDhcp"] = config.fallbackToDhcp;
+  }
+
+  bool configurationFromJson(JsonDocument &jsonDocument, WifiConfiguration &config, bool partial)
+  {
+    if (!_validateJsonConfiguration(jsonDocument, partial)) {
+      LOG_WARNING("Invalid network configuration JSON");
+      return false;
+    }
+
+    if (jsonDocument["useStaticIp"].is<bool>())     config.useStaticIp = jsonDocument["useStaticIp"].as<bool>();
+    if (jsonDocument["ip"].is<const char*>())       snprintf(config.ip, sizeof(config.ip), "%s", jsonDocument["ip"].as<const char*>());
+    if (jsonDocument["gateway"].is<const char*>())  snprintf(config.gateway, sizeof(config.gateway), "%s", jsonDocument["gateway"].as<const char*>());
+    if (jsonDocument["subnet"].is<const char*>())   snprintf(config.subnet, sizeof(config.subnet), "%s", jsonDocument["subnet"].as<const char*>());
+    if (jsonDocument["dns1"].is<const char*>())     snprintf(config.dns1, sizeof(config.dns1), "%s", jsonDocument["dns1"].as<const char*>());
+    if (jsonDocument["dns2"].is<const char*>())     snprintf(config.dns2, sizeof(config.dns2), "%s", jsonDocument["dns2"].as<const char*>());
+    if (jsonDocument["fallbackToDhcp"].is<bool>()) config.fallbackToDhcp = jsonDocument["fallbackToDhcp"].as<bool>();
+
+    // Cross-field validation on the merged result (catches e.g. useStaticIp=true with no IP via PATCH)
+    return _validateConfiguration(config);
+  }
+
+  static bool _validateJsonConfiguration(JsonDocument &jsonDocument, bool partial)
+  {
+    if (jsonDocument.isNull() || !jsonDocument.is<JsonObject>()) {
+      LOG_WARNING("Invalid JSON document");
+      return false;
+    }
+
+    if (partial) {
+      // At least one valid field must be present
+      if (jsonDocument["useStaticIp"].is<bool>())    return true;
+      if (jsonDocument["ip"].is<const char*>())      return true;
+      if (jsonDocument["gateway"].is<const char*>()) return true;
+      if (jsonDocument["subnet"].is<const char*>())  return true;
+      if (jsonDocument["dns1"].is<const char*>())    return true;
+      if (jsonDocument["dns2"].is<const char*>())    return true;
+      if (jsonDocument["fallbackToDhcp"].is<bool>()) return true;
+      LOG_WARNING("No valid fields found in JSON document");
+      return false;
+    }
+
+    // Full validation - all fields must be present and of the right type
+    if (!jsonDocument["useStaticIp"].is<bool>())    { LOG_WARNING("useStaticIp field is not a boolean"); return false; }
+    if (!jsonDocument["ip"].is<const char*>())      { LOG_WARNING("ip field is not a string"); return false; }
+    if (!jsonDocument["gateway"].is<const char*>()) { LOG_WARNING("gateway field is not a string"); return false; }
+    if (!jsonDocument["subnet"].is<const char*>())  { LOG_WARNING("subnet field is not a string"); return false; }
+    if (!jsonDocument["dns1"].is<const char*>())    { LOG_WARNING("dns1 field is not a string"); return false; }
+    if (!jsonDocument["dns2"].is<const char*>())    { LOG_WARNING("dns2 field is not a string"); return false; }
+    if (!jsonDocument["fallbackToDhcp"].is<bool>()) { LOG_WARNING("fallbackToDhcp field is not a boolean"); return false; }
+    return true;
+  }
+
+  static bool _validateConfiguration(const WifiConfiguration &config)
+  {
+    if (config.useStaticIp) {
+      // IP, gateway and subnet are mandatory and must be non-zero; DNS servers are optional
+      if (!_isValidIpv4(config.ip, false))      { LOG_WARNING("Static IP enabled but 'ip' is invalid"); return false; }
+      if (!_isValidIpv4(config.gateway, false)) { LOG_WARNING("Static IP enabled but 'gateway' is invalid"); return false; }
+      if (!_isValidIpv4(config.subnet, false))  { LOG_WARNING("Static IP enabled but 'subnet' is invalid"); return false; }
+      if (config.dns1[0] != '\0' && !_isValidIpv4(config.dns1, true)) { LOG_WARNING("Invalid 'dns1' address"); return false; }
+      if (config.dns2[0] != '\0' && !_isValidIpv4(config.dns2, true)) { LOG_WARNING("Invalid 'dns2' address"); return false; }
+    }
+
+    return true;
+  }
+
+  static void _loadConfiguration()
+  {
+    LOG_DEBUG("Loading network configuration from Preferences...");
+
+    WifiConfiguration config; // Constructor sets all defaults
+
+    Preferences preferences;
+    if (preferences.begin(PREFERENCES_NAMESPACE_WIFI, true)) {
+      config.useStaticIp = preferences.getBool(WIFI_CONFIG_USE_STATIC_KEY, WIFI_USE_STATIC_IP_DEFAULT);
+      snprintf(config.ip, sizeof(config.ip), "%s", preferences.getString(WIFI_CONFIG_IP_KEY, "").c_str());
+      snprintf(config.gateway, sizeof(config.gateway), "%s", preferences.getString(WIFI_CONFIG_GATEWAY_KEY, "").c_str());
+      snprintf(config.subnet, sizeof(config.subnet), "%s", preferences.getString(WIFI_CONFIG_SUBNET_KEY, "").c_str());
+      snprintf(config.dns1, sizeof(config.dns1), "%s", preferences.getString(WIFI_CONFIG_DNS1_KEY, "").c_str());
+      snprintf(config.dns2, sizeof(config.dns2), "%s", preferences.getString(WIFI_CONFIG_DNS2_KEY, "").c_str());
+      config.fallbackToDhcp = preferences.getBool(WIFI_CONFIG_FALLBACK_KEY, WIFI_FALLBACK_TO_DHCP_DEFAULT);
+      preferences.end();
+    } else {
+      LOG_ERROR("Failed to open Preferences namespace for WiFi. Using default configuration");
+    }
+
+    // setConfiguration persists the (possibly default) values back to NVS, so missing keys
+    // are materialized on first boot - a clean migration with no separate version flag.
+    // If the stored values fail validation (corruption / firmware downgrade), fall back to
+    // defaults so the config subsystem (and its mutex) is always initialized.
+    if (!setConfiguration(config)) {
+      LOG_WARNING("Stored network configuration invalid - reverting to defaults");
+      WifiConfiguration defaultConfig;
+      setConfiguration(defaultConfig);
+    }
+
+    LOG_DEBUG("Network configuration loaded");
+  }
+
+  static void _saveConfigurationToPreferences(const WifiConfiguration &config)
+  {
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE_WIFI, false)) {
+      LOG_ERROR("Failed to open Preferences namespace for WiFi");
+      return;
+    }
+
+    preferences.putBool(WIFI_CONFIG_USE_STATIC_KEY, config.useStaticIp);
+    preferences.putString(WIFI_CONFIG_IP_KEY, config.ip);
+    preferences.putString(WIFI_CONFIG_GATEWAY_KEY, config.gateway);
+    preferences.putString(WIFI_CONFIG_SUBNET_KEY, config.subnet);
+    preferences.putString(WIFI_CONFIG_DNS1_KEY, config.dns1);
+    preferences.putString(WIFI_CONFIG_DNS2_KEY, config.dns2);
+    preferences.putBool(WIFI_CONFIG_FALLBACK_KEY, config.fallbackToDhcp);
+
+    preferences.end();
+    LOG_DEBUG("Network configuration saved to Preferences");
+  }
+
+  // Apply the network configuration to the radio. Must run after WiFi.mode(WIFI_STA) and
+  // before the connection attempt. Static IP is set via WiFi.config(); WiFiManager only
+  // overrides this when it has its own static IP set (it does not), so the config survives
+  // autoConnect. When static IP is disabled we leave the netif on DHCP (its boot default).
+  static void _applyNetworkConfiguration()
+  {
+    WifiConfiguration config;
+    if (!getConfiguration(config)) return;
+
+    _staticIpApplied = false;
+
+    if (!config.useStaticIp) {
+      LOG_DEBUG("Using DHCP for IP configuration");
+      return;
+    }
+
+    // Backstop: if the last few boots with this static IP all failed, ignore it and come up on
+    // DHCP so the device is always recoverable. The counter is cleared once static is confirmed
+    // healthy (_serviceStaticIpHealth) or the user saves a new config (setConfigurationFromJson).
+    uint8_t bootFails = _getStaticBootFails();
+    if (bootFails >= WIFI_STATIC_IP_MAX_BOOT_FAILS) {
+      LOG_WARNING("Static IP disabled after %u failed boots - using DHCP (config kept, save again to retry)", bootFails);
+      return;
+    }
+
+    IPAddress ip, gateway, subnet, dns1, dns2;
+    if (!(ip.fromString(config.ip) && gateway.fromString(config.gateway) && subnet.fromString(config.subnet))) {
+      LOG_WARNING("Static IP enabled but addresses invalid - using DHCP");
+      return;
+    }
+
+    // DNS is mandatory for the radio to resolve hostnames (AWS/MQTT/NTP). When the user leaves it
+    // blank, default the primary DNS to the gateway (routers commonly relay DNS) rather than 0.0.0.0,
+    // which would silently break name resolution.
+    if (!dns1.fromString(config.dns1)) dns1 = gateway;
+    dns2.fromString(config.dns2); // Optional - stays 0.0.0.0 when empty
+
+    // Count this attempt BEFORE applying, so a crash or lock-out mid-boot still accumulates.
+    _setStaticBootFails(bootFails + 1);
+
+    if (WiFi.config(ip, gateway, subnet, dns1, dns2)) {
+      _staticIpApplied = true;
+      LOG_INFO("Static IP configured: %s (gateway: %s, attempt %u)", config.ip, config.gateway, bootFails + 1);
+    } else {
+      LOG_ERROR("Failed to apply static IP configuration - falling back to DHCP");
+    }
+  }
+
+  // Persistent count of consecutive static-IP boots that did not reach healthy connectivity.
+  // Backs the boot-fail backstop in _applyNetworkConfiguration. Stored in wifi_ns.
+  static uint8_t _getStaticBootFails()
+  {
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE_WIFI, true)) return 0;
+    uint8_t count = preferences.getUChar(WIFI_CONFIG_STATIC_FAILS_KEY, 0);
+    preferences.end();
+    return count;
+  }
+
+  static void _setStaticBootFails(uint8_t count)
+  {
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE_WIFI, false)) {
+      LOG_ERROR("Failed to open Preferences to update static boot-fail counter");
+      return;
+    }
+    preferences.putUChar(WIFI_CONFIG_STATIC_FAILS_KEY, count);
+    preferences.end();
+  }
+
+  // Services the two static-IP safety nets from the periodic WiFi check (runs only when a static IP
+  // was actually applied this boot). Recovery is always by restart-onto-DHCP, never by live netif
+  // reconfiguration (WiFi.config(0,0,0) races lwIP and asserts in ip4_route during the IP-less window).
+  static void _serviceStaticIpHealth(bool internetReachable)
+  {
+    if (!_staticIpApplied) return; // DHCP boot, or static was skipped by the backstop - nothing to manage
+
+    // Backstop clear: reaching a periodic check still connected means the static IP is past the early
+    // crash/assoc window and is not a boot-loop offender. Clear the counter (internet-independent, so a
+    // valid LAN-only static IP is never disabled). Gated on _staticIpApplied, so the DHCP recovery boot
+    // (where static was skipped) never clears it - that would re-arm a known-bad static IP and oscillate.
+    if (!_staticBackstopCleared) {
+      _setStaticBootFails(0);
+      _staticBackstopCleared = true;
+      LOG_INFO("Static IP stable - boot-fail backstop counter cleared");
+    }
+
+    // DHCP auto-recovery: only when the user opted in, and only until the first successful check
+    // (so a later internet blip on a good static IP can never reboot the device off it).
+    if (_staticRecoveryResolved) return;
+
+    WifiConfiguration config;
+    if (!getConfiguration(config) || !config.fallbackToDhcp) return;
+
+    if (internetReachable) {
+      _staticRecoveryResolved = true; // Confirmed good - disarm for the rest of this boot
+      return;
+    }
+
+    _staticInternetFailStreak++;
+    if (_staticInternetFailStreak < WIFI_STATIC_IP_FAIL_STREAK) {
+      LOG_WARNING("Static IP has no internet (%u/%u) - will recover on DHCP if it persists",
+                  _staticInternetFailStreak, WIFI_STATIC_IP_FAIL_STREAK);
+      return;
+    }
+
+    // Persistently unreachable: force the backstop so the next boot comes up on DHCP, then restart once.
+    // The restart gate's minimum uptime is already satisfied by the time the periodic check fires.
+    _staticRecoveryResolved = true;
+    LOG_WARNING("Static IP has no internet - forcing DHCP and restarting to recover (static config kept in NVS)");
+    _setStaticBootFails(WIFI_STATIC_IP_MAX_BOOT_FAILS);
+    setRestartSystem("Static IP unreachable - recovering on DHCP");
+  }
+
+  TaskInfo getTaskInfo()
+  {
+    return getTaskInfoSafely(_wifiTaskHandle, WIFI_TASK_STACK_SIZE, &_heartbeat);
+  }
+}

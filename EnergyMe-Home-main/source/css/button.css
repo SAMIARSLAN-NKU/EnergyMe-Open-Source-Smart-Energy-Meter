@@ -1,0 +1,231 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2025 Jibril Sharafi */
+
+.buttonNavigation-container {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-evenly;
+    width: 50%;
+    margin-top: 20px;
+    margin-bottom: 50px;
+    /* Mobile responsive adjustments */
+    flex-wrap: wrap;
+    max-width: 100%;
+    gap: 10px;
+}
+
+/* Base navigation button styles - shared between internal and external links */
+.buttonNavigation,
+.buttonNavigationExternal {
+    background: transparent;
+    font-weight: bold;
+    font-size: 1.2em;
+    cursor: pointer;
+    padding: 10px 20px;
+    border-radius: 50px;
+    text-decoration: none;
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.4);
+    transition: all 0.1s ease;
+    white-space: nowrap;
+    flex: 0 1 auto;
+    text-align: center;
+    min-width: fit-content;
+}
+
+.buttonNavigation:hover,
+.buttonNavigationExternal:hover {
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.6);
+}
+
+.buttonNavigation:active,
+.buttonNavigationExternal:active {
+    transform: scale(0.98);
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.8);
+}
+
+/* Navigation button color variants */
+.buttonNavigation {
+    color: var(--blue);
+}
+
+.buttonNavigation[type="home"] {
+    color: var(--green);
+}
+
+.buttonNavigation[type="inner"] {
+    color: #ff9800;
+}
+
+.buttonNavigation[type="outer"] {
+    color: var(--blue);
+}
+
+.buttonNavigationExternal {
+    color: #1bacdc;
+}
+
+.buttonForm-container {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-evenly;
+    width: 50%;
+    margin-bottom: 100px;
+    /* Mobile responsive adjustments */
+    flex-wrap: wrap;
+    max-width: 100%;
+    gap: 10px;
+}
+
+.buttonForm {
+    background: transparent;
+    background-color: #f4f4f4;
+    color: var(--green);
+    font-weight: bold;
+    padding: 10px 20px;
+    border-radius: 50px;
+    font-size: 1.0em;
+    cursor: pointer;
+    text-decoration: none;
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+    transition: all 0.1s ease;
+    border: 1px solid;
+    margin-top: 10px;
+    /* Mobile responsive adjustments */
+    white-space: nowrap;
+    text-align: center;
+    min-width: fit-content;
+    flex: 0 1 auto; /* Allow natural sizing */
+}
+
+.buttonForm:hover {
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.4);
+}
+
+.buttonForm:active {
+    transform: scale(0.98);
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.6);
+}
+
+.buttonForm:disabled {
+    color: var(--blue);
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+    background-color: #bf7c0054;
+    pointer-events: none;
+}
+
+.tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: pointer;
+    background: none;
+    border: none;
+    color: #000000;
+    font-size: 24px;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    background-color: #555;
+    color: #fff;
+    text-align: center;
+    border-radius: 6px;
+    padding: 5px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%; /* Position the tooltip above the icon */
+    opacity: 0;
+    transition: opacity 0.3s;
+    font-size: 14px;
+    white-space: nowrap;
+    /* Mobile responsive adjustments */
+    max-width: 200px;
+    white-space: normal;
+    word-wrap: break-word;
+}
+
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 0.9;
+}
+
+/* Mobile-first responsive styles */
+@media screen and (max-width: 768px) {
+    .buttonNavigation-container {
+        width: 95%;
+        flex-direction: column;
+        align-items: center;
+        margin-bottom: 30px;
+        gap: 15px;
+    }
+    
+    .buttonNavigation,
+    .buttonNavigationExternal {
+        font-size: 1.0em;
+        padding: 12px 24px;
+        width: auto;
+        max-width: 280px;
+        margin: 0;
+        min-width: fit-content;
+        flex: 0 1 auto;
+    }
+    
+    .buttonForm-container {
+        width: 95%;
+        flex-direction: column;
+        align-items: center;
+        margin-bottom: 50px;
+        gap: 15px;
+    }
+    
+    .buttonForm {
+        font-size: 0.9em;
+        padding: 12px 20px;
+        width: auto;
+        max-width: 250px;
+        margin: 0;
+        min-width: fit-content;
+        flex: 0 1 auto;
+    }
+    
+    .tooltip .tooltiptext {
+        font-size: 12px;
+        max-width: 180px;
+        left: 50%;
+        transform: translateX(-50%);
+        margin-left: 0;
+    }
+}
+
+@media screen and (max-width: 480px) {
+    .buttonNavigation-container {
+        width: 98%;
+        margin-bottom: 20px;
+        gap: 12px;
+    }
+    
+    .buttonNavigation,
+    .buttonNavigationExternal {
+        font-size: 0.9em;
+        padding: 10px 16px;
+        max-width: none;
+        width: auto;
+    }
+    
+    .buttonForm-container {
+        width: 98%;
+        margin-bottom: 30px;
+        gap: 12px;
+    }
+    
+    .buttonForm {
+        font-size: 0.85em;
+        padding: 10px 16px;
+        max-width: none;
+        width: auto;
+    }
+    
+    .tooltip .tooltiptext {
+        font-size: 11px;
+        max-width: 150px;
+    }
+}

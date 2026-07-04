@@ -1,0 +1,2342 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Jibril Sharafi
+
+#include "utils.h"
+#include "duration_format.h"
+
+#include "taskprofiler.h"
+
+static TaskHandle_t _restartTaskHandle = NULL;
+static TaskHandle_t _maintenanceTaskHandle = NULL;
+static bool _maintenanceTaskShouldRun = false;
+
+static esp_timer_handle_t _failsafeTimer = NULL;
+
+static TaskHeartbeat _maintenanceHeartbeat;
+
+// Static function declarations
+static void _factoryReset();
+static void _restartTask(void* parameter);
+static void _failsafeRestartCallback(void* parameter);
+static void _startFailsafeTimer();
+static void _maintenanceTask(void* parameter);
+static bool _listLittleFsFilesRecursive(JsonDocument &doc, const char* dirname, const char* basePath, uint8_t levels);
+static bool _ensureDirectoryExists(const char* dirPath);
+static bool _decompressGzipFile(const char* gzPath, const char* outputPath);
+static bool _appendFileToFile(const char* srcPath, File &destFile, bool skipHeader);
+
+// New system info functions
+void populateSystemStaticInfo(SystemStaticInfo& info) {
+    // Initialize the struct to ensure clean state
+    memset(&info, 0, sizeof(info));
+
+    // Product info
+    snprintf(info.companyName, sizeof(info.companyName), "%s", COMPANY_NAME);
+    snprintf(info.productName, sizeof(info.productName), "%s", PRODUCT_NAME);
+    snprintf(info.fullProductName, sizeof(info.fullProductName), "%s", FULL_PRODUCT_NAME);
+    snprintf(info.productDescription, sizeof(info.productDescription), "%s", PRODUCT_DESCRIPTION);
+    snprintf(info.githubUrl, sizeof(info.githubUrl), "%s", GITHUB_URL);
+    snprintf(info.author, sizeof(info.author), "%s", AUTHOR);
+    snprintf(info.authorEmail, sizeof(info.authorEmail), "%s", AUTHOR_EMAIL);
+    
+    // Firmware info
+    snprintf(info.buildVersion, sizeof(info.buildVersion), "%s", FIRMWARE_BUILD_VERSION);
+    snprintf(info.buildDate, sizeof(info.buildDate), "%s", FIRMWARE_BUILD_DATE);
+    snprintf(info.buildTime, sizeof(info.buildTime), "%s", FIRMWARE_BUILD_TIME);
+    snprintf(info.sketchMD5, sizeof(info.sketchMD5), "%s", ESP.getSketchMD5().c_str());
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    snprintf(info.partitionAppName, sizeof(info.partitionAppName), "%s", running->label);
+    
+    // Hardware info
+    snprintf(info.chipModel, sizeof(info.chipModel), "%s", ESP.getChipModel());
+    info.chipRevision = ESP.getChipRevision();
+    info.chipCores = ESP.getChipCores();
+    info.chipId = ESP.getEfuseMac();
+    info.flashChipSizeBytes = ESP.getFlashChipSize();
+    info.flashChipSpeedHz = ESP.getFlashChipSpeed();
+    info.psramSizeBytes = ESP.getPsramSize();
+    info.cpuFrequencyMHz = ESP.getCpuFreqMHz();
+    
+    // Crash and reset monitoring
+    info.crashCount = CrashMonitor::getCrashCount();
+    info.consecutiveCrashCount = CrashMonitor::getConsecutiveCrashCount();
+    info.resetCount = CrashMonitor::getResetCount();
+    info.consecutiveResetCount = CrashMonitor::getConsecutiveResetCount();
+    info.lastResetReason = (uint32_t)esp_reset_reason();
+    snprintf(info.lastResetReasonString, sizeof(info.lastResetReasonString), "%s", getResetReasonString(esp_reset_reason()));
+    info.lastResetWasCrash = CrashMonitor::isLastResetDueToCrash();
+    
+    // SDK info
+    snprintf(info.sdkVersion, sizeof(info.sdkVersion), "%s", ESP.getSdkVersion());
+    snprintf(info.coreVersion, sizeof(info.coreVersion), "%s", ESP.getCoreVersion());
+    
+    // Device ID
+    getDeviceId(info.deviceId, sizeof(info.deviceId));
+
+    // Factory provisioning data (written at manufacturing time; defaults kept otherwise)
+    Preferences factoryPrefs;
+    if (factoryPrefs.begin(PREFERENCES_NAMESPACE_FACTORY, true)) {
+        factoryPrefs.getString(FACTORY_KEY_SERIAL_NUMBER, info.serialNumber, sizeof(info.serialNumber));
+        if (strlen(info.serialNumber) == 0) {
+            snprintf(info.serialNumber, sizeof(info.serialNumber), "Unknown");
+        }
+        info.manufacturingUnixTs = factoryPrefs.getULong(FACTORY_KEY_MFG_TS, 0);
+        factoryPrefs.end();
+    }
+
+    LOG_DEBUG("Static system info populated");
+}
+
+void populateSystemDynamicInfo(SystemDynamicInfo& info) {
+    // Initialize the struct to ensure clean state
+    memset(&info, 0, sizeof(info));
+
+    // Time
+    info.uptimeMilliseconds = millis64();
+    info.uptimeSeconds = info.uptimeMilliseconds / 1000;
+    CustomTime::getTimestampIso(info.currentTimestampIso, sizeof(info.currentTimestampIso));
+
+    // Memory - Heap
+    info.heapTotalBytes = ESP.getHeapSize();
+    info.heapFreeBytes = ESP.getFreeHeap();
+    info.heapUsedBytes = info.heapTotalBytes - info.heapFreeBytes;
+    info.heapMinFreeBytes = ESP.getMinFreeHeap();
+    info.heapMaxAllocBytes = ESP.getMaxAllocHeap();
+    info.heapFreePercentage = info.heapTotalBytes > 0 ? ((float)info.heapFreeBytes / (float)info.heapTotalBytes) * 100.0f : 0.0f;
+    info.heapUsedPercentage = 100.0f - info.heapFreePercentage;
+    
+    // Memory - PSRAM
+    info.psramTotalBytes = ESP.getPsramSize();
+    if (info.psramTotalBytes > 0) {
+        info.psramFreeBytes = ESP.getFreePsram();
+        info.psramUsedBytes = info.psramTotalBytes - info.psramFreeBytes;
+        info.psramMinFreeBytes = ESP.getMinFreePsram();
+        info.psramMaxAllocBytes = ESP.getMaxAllocPsram();
+        info.psramFreePercentage = info.psramTotalBytes > 0 ? ((float)info.psramFreeBytes / (float)info.psramTotalBytes) * 100.0f : 0.0f;
+        info.psramUsedPercentage = 100.0f - info.psramFreePercentage;
+    } else {
+        info.psramFreeBytes = 0;
+        info.psramUsedBytes = 0;
+        info.psramMinFreeBytes = 0;
+        info.psramMaxAllocBytes = 0;
+        info.psramFreePercentage = 0.0f;
+        info.psramUsedPercentage = 0.0f;
+    }
+    
+    // Storage - LittleFS
+    info.littlefsTotalBytes = LittleFS.totalBytes();
+    info.littlefsUsedBytes = LittleFS.usedBytes();
+    info.littlefsFreeBytes = info.littlefsTotalBytes - info.littlefsUsedBytes;
+    info.littlefsFreePercentage = info.littlefsTotalBytes > 0 ? ((float)info.littlefsFreeBytes / (float)info.littlefsTotalBytes) * 100.0f : 0.0f;
+    info.littlefsUsedPercentage = 100.0f - info.littlefsFreePercentage;
+
+    // Storage - NVS
+    nvs_stats_t nvs_stats;
+    esp_err_t err = nvs_get_stats(NULL, &nvs_stats);
+    if (err != ESP_OK) {
+        LOG_ERROR("Failed to get NVS stats: %s", esp_err_to_name(err));
+        info.usedEntries = 0;
+        info.availableEntries = 0;
+        info.totalUsableEntries = 0;
+        info.usedEntriesPercentage = 0.0f;
+        info.availableEntriesPercentage = 0.0f;
+        info.namespaceCount = 0;
+    } else {
+        info.usedEntries = nvs_stats.used_entries;
+        info.availableEntries = nvs_stats.available_entries;
+        info.totalUsableEntries = info.usedEntries + info.availableEntries; // Some are reserved
+        info.usedEntriesPercentage = info.totalUsableEntries > 0 ? ((float)info.usedEntries / (float)info.totalUsableEntries) * 100.0f : 0.0f;
+        info.availableEntriesPercentage = info.totalUsableEntries > 0 ? ((float)info.availableEntries / (float)info.totalUsableEntries) * 100.0f : 0.0f;
+        info.namespaceCount = nvs_stats.namespace_count;
+    }
+
+    // Performance
+    info.temperatureCelsius = temperatureRead();
+
+    // CPU stats over a window matching the system_dynamic publish cadence.
+    // ENV_DEV: last 60 s; ENV_PROD: full 3600 s ring.
+#ifdef ENV_DEV
+    static constexpr uint32_t CPU_STATS_WINDOW_SECONDS = 60;
+#else
+    static constexpr uint32_t CPU_STATS_WINDOW_SECONDS = 0; // 0 = full ring
+#endif
+    info.cpuCore0Stats = TaskProfiler::getCpuStats(0, CPU_STATS_WINDOW_SECONDS);
+    info.cpuCore1Stats = TaskProfiler::getCpuStats(1, CPU_STATS_WINDOW_SECONDS);
+
+    // Network (if connected)
+    if (CustomWifi::isFullyConnected()) {
+        info.wifiConnected = true;
+        info.wifiRssi = WiFi.RSSI();
+        snprintf(info.wifiSsid, sizeof(info.wifiSsid), "%s", WiFi.SSID().c_str());
+        snprintf(info.wifiLocalIp, sizeof(info.wifiLocalIp), "%s", WiFi.localIP().toString().c_str());
+        snprintf(info.wifiGatewayIp, sizeof(info.wifiGatewayIp), "%s", WiFi.gatewayIP().toString().c_str());
+        snprintf(info.wifiSubnetMask, sizeof(info.wifiSubnetMask), "%s", WiFi.subnetMask().toString().c_str());
+        snprintf(info.wifiDnsIp, sizeof(info.wifiDnsIp), "%s", WiFi.dnsIP().toString().c_str());
+        snprintf(info.wifiBssid, sizeof(info.wifiBssid), "%s", WiFi.BSSIDstr().c_str());
+    } else {
+        info.wifiConnected = false;
+        info.wifiRssi = -100; // Invalid RSSI
+        snprintf(info.wifiSsid, sizeof(info.wifiSsid), "Not connected");
+        snprintf(info.wifiLocalIp, sizeof(info.wifiLocalIp), "0.0.0.0");
+        snprintf(info.wifiGatewayIp, sizeof(info.wifiGatewayIp), "0.0.0.0");
+        snprintf(info.wifiSubnetMask, sizeof(info.wifiSubnetMask), "0.0.0.0");
+        snprintf(info.wifiDnsIp, sizeof(info.wifiDnsIp), "0.0.0.0");
+        snprintf(info.wifiBssid, sizeof(info.wifiBssid), "00:00:00:00:00:00");
+    }
+    snprintf(info.wifiMacAddress, sizeof(info.wifiMacAddress), "%s", WiFi.macAddress().c_str()); // MAC is available even when disconnected
+
+    // Tasks
+    if (!globalCommunityMode) {
+        info.mqttTaskInfo = Mqtt::getMqttTaskInfo();
+        info.mqttOtaTaskInfo = Mqtt::getMqttOtaTaskInfo();
+    }
+    info.customMqttTaskInfo = CustomMqtt::getTaskInfo();
+    info.customServerHealthCheckTaskInfo = CustomServer::getHealthCheckTaskInfo();
+    info.customServerOtaTimeoutTaskInfo = CustomServer::getOtaTimeoutTaskInfo();
+    info.ledTaskInfo = Led::getTaskInfo();
+    info.influxDbTaskInfo = InfluxDbClient::getTaskInfo();
+    info.crashMonitorTaskInfo = CrashMonitor::getTaskInfo();
+    info.buttonHandlerTaskInfo = ButtonHandler::getTaskInfo();
+    info.udpLogTaskInfo = CustomLog::getTaskInfo();
+    info.customWifiTaskInfo = CustomWifi::getTaskInfo();
+    info.ade7953MeterReadingTaskInfo = Ade7953::getMeterReadingTaskInfo();
+    info.ade7953EnergySaveTaskInfo = Ade7953::getEnergySaveTaskInfo();
+    info.ade7953HourlyCsvTaskInfo = Ade7953::getHourlyCsvTaskInfo();
+    info.maintenanceTaskInfo = getMaintenanceTaskInfo();
+    info.issueRegistryTaskInfo = IssueRegistry::getTaskInfo();
+
+    LOG_DEBUG("Dynamic system info populated");
+}
+
+void systemStaticInfoToJson(SystemStaticInfo& info, JsonDocument &doc) {
+    // No need to use String for dandling pointer data since most of it here is
+    // coming from compiled static variables
+        
+    // Product
+    doc["product"]["companyName"] = info.companyName;
+    doc["product"]["productName"] = info.productName;
+    doc["product"]["fullProductName"] = info.fullProductName;
+    doc["product"]["productDescription"] = info.productDescription;
+    doc["product"]["githubUrl"] = info.githubUrl;
+    doc["product"]["author"] = info.author;
+    doc["product"]["authorEmail"] = info.authorEmail;
+    
+    // Firmware
+    doc["firmware"]["buildVersion"] = info.buildVersion;
+    doc["firmware"]["buildDate"] = info.buildDate;
+    doc["firmware"]["buildTime"] = info.buildTime;
+    doc["firmware"]["sketchMD5"] = info.sketchMD5;
+    doc["firmware"]["partitionAppName"] = info.partitionAppName;
+
+    // Hardware
+    doc["hardware"]["chipModel"] = info.chipModel;
+    doc["hardware"]["chipRevision"] = info.chipRevision;
+    doc["hardware"]["chipCores"] = info.chipCores;
+    doc["hardware"]["chipId"] = (uint64_t)info.chipId;
+    doc["hardware"]["cpuFrequencyMHz"] = info.cpuFrequencyMHz;
+    doc["hardware"]["flashChipSizeBytes"] = info.flashChipSizeBytes;
+    doc["hardware"]["flashChipSpeedHz"] = info.flashChipSpeedHz;
+    doc["hardware"]["psramSizeBytes"] = info.psramSizeBytes;
+    doc["hardware"]["cpuFrequencyMHz"] = info.cpuFrequencyMHz;
+
+    // Crash monitoring
+    doc["monitoring"]["crashCount"] = info.crashCount;
+    doc["monitoring"]["consecutiveCrashCount"] = info.consecutiveCrashCount;
+    doc["monitoring"]["resetCount"] = info.resetCount;
+    doc["monitoring"]["consecutiveResetCount"] = info.consecutiveResetCount;
+    doc["monitoring"]["lastResetReason"] = info.lastResetReason;
+    doc["monitoring"]["lastResetReasonString"] = info.lastResetReasonString;
+    doc["monitoring"]["lastResetWasCrash"] = info.lastResetWasCrash;
+    
+    // SDK
+    doc["sdk"]["sdkVersion"] = info.sdkVersion;
+    doc["sdk"]["coreVersion"] = info.coreVersion;
+    
+    // Device
+    doc["device"]["id"] = info.deviceId;
+#ifdef ENV_DEV
+    doc["device"]["devBuild"] = true;
+#else
+    doc["device"]["devBuild"] = false;
+#endif
+
+    // Factory provisioning (Unknown / 0 when the device was not factory-provisioned)
+    doc["factory"]["serialNumber"] = info.serialNumber;
+    doc["factory"]["manufacturingUnixTs"] = info.manufacturingUnixTs;
+
+    LOG_DEBUG("Static system info converted to JSON");
+}
+
+void systemDynamicInfoToJson(SystemDynamicInfo& info, JsonDocument &doc) {
+    // Time
+    doc["time"]["uptimeMilliseconds"] = (uint64_t)info.uptimeMilliseconds;
+    doc["time"]["uptimeSeconds"] = info.uptimeSeconds;
+    doc["time"]["currentTimestampIso"] = info.currentTimestampIso;
+
+    // Memory - Heap
+    doc["memory"]["heap"]["totalBytes"] = info.heapTotalBytes;
+    doc["memory"]["heap"]["freeBytes"] = info.heapFreeBytes;
+    doc["memory"]["heap"]["usedBytes"] = info.heapUsedBytes;
+    doc["memory"]["heap"]["minFreeBytes"] = info.heapMinFreeBytes;
+    doc["memory"]["heap"]["maxAllocBytes"] = info.heapMaxAllocBytes;
+    doc["memory"]["heap"]["freePercentage"] = info.heapFreePercentage;
+    doc["memory"]["heap"]["usedPercentage"] = info.heapUsedPercentage;
+    
+    // Memory - PSRAM
+    doc["memory"]["psram"]["totalBytes"] = info.psramTotalBytes;
+    doc["memory"]["psram"]["freeBytes"] = info.psramFreeBytes;
+    doc["memory"]["psram"]["usedBytes"] = info.psramUsedBytes;
+    doc["memory"]["psram"]["minFreeBytes"] = info.psramMinFreeBytes;
+    doc["memory"]["psram"]["maxAllocBytes"] = info.psramMaxAllocBytes;
+    doc["memory"]["psram"]["freePercentage"] = info.psramFreePercentage;
+    doc["memory"]["psram"]["usedPercentage"] = info.psramUsedPercentage;
+    
+    // Storage
+    doc["storage"]["littlefs"]["totalBytes"] = info.littlefsTotalBytes;
+    doc["storage"]["littlefs"]["usedBytes"] = info.littlefsUsedBytes;
+    doc["storage"]["littlefs"]["freeBytes"] = info.littlefsFreeBytes;
+    doc["storage"]["littlefs"]["freePercentage"] = info.littlefsFreePercentage;
+    doc["storage"]["littlefs"]["usedPercentage"] = info.littlefsUsedPercentage;
+
+    // Storage - NVS
+    doc["storage"]["nvs"]["totalUsableEntries"] = info.totalUsableEntries;
+    doc["storage"]["nvs"]["usedEntries"] = info.usedEntries;
+    doc["storage"]["nvs"]["availableEntries"] = info.availableEntries;
+    doc["storage"]["nvs"]["usedEntriesPercentage"] = info.usedEntriesPercentage;
+    doc["storage"]["nvs"]["availableEntriesPercentage"] = info.availableEntriesPercentage;
+    doc["storage"]["nvs"]["namespaceCount"] = info.namespaceCount;
+
+    // Performance
+    doc["performance"]["temperatureCelsius"] = info.temperatureCelsius;
+
+    // CPU stats (per core, spike-aware ring buffer)
+    auto addCpuCore = [&](const char* key, const TaskProfiler::CpuStats& s) {
+        doc["cpu"][key]["current"]               = s.current;
+        doc["cpu"][key]["min"]                   = s.min;
+        doc["cpu"][key]["max"]                   = s.max;
+        doc["cpu"][key]["avg"]                   = s.avg;
+        doc["cpu"][key]["p50"]                   = s.p50;
+        doc["cpu"][key]["p90"]                   = s.p90;
+        doc["cpu"][key]["p95"]                   = s.p95;
+        doc["cpu"][key]["p99"]                   = s.p99;
+        doc["cpu"][key]["samplesInWindow"]        = s.samplesInWindow;
+        doc["cpu"][key]["samplesAboveThreshold"]  = s.samplesAboveThreshold;
+        doc["cpu"][key]["windowSeconds"]          = s.windowSeconds;
+    };
+    addCpuCore("core0", info.cpuCore0Stats);
+    addCpuCore("core1", info.cpuCore1Stats);
+
+    // Network
+    doc["network"]["wifiConnected"] = info.wifiConnected;
+    doc["network"]["wifiSsid"] = JsonString(info.wifiSsid); // Ensure it is not a dangling pointer
+    doc["network"]["wifiMacAddress"] = JsonString(info.wifiMacAddress); // Ensure it is not a dangling pointer
+    doc["network"]["wifiLocalIp"] = JsonString(info.wifiLocalIp); // Ensure it is not a dangling pointer
+    doc["network"]["wifiGatewayIp"] = JsonString(info.wifiGatewayIp); // Ensure it is not a dangling pointer
+    doc["network"]["wifiSubnetMask"] = JsonString(info.wifiSubnetMask); // Ensure it is not a dangling pointer
+    doc["network"]["wifiDnsIp"] = JsonString(info.wifiDnsIp); // Ensure it is not a dangling pointer
+    doc["network"]["wifiBssid"] = JsonString(info.wifiBssid); // Ensure it is not a dangling pointer
+    doc["network"]["wifiRssi"] = info.wifiRssi;
+
+    // Tasks
+    uint64_t nowMs = millis64();
+    auto addTask = [&](const char* name, const TaskInfo& t) {
+        doc["tasks"][name]["allocatedStack"] = t.allocatedStack;
+        doc["tasks"][name]["minimumFreeStack"] = t.minimumFreeStack;
+        doc["tasks"][name]["freePercentage"] = t.freePercentage;
+        doc["tasks"][name]["usedPercentage"] = t.usedPercentage;
+        doc["tasks"][name]["lastTickMillis"] = (uint64_t)t.lastTickMillis;
+        doc["tasks"][name]["loopCount"] = t.loopCount;
+        // staleMs == 0 means "task not instrumented" (no TASK_HEARTBEAT call) - it does
+        // not mean the task ticked this exact ms. Consumers that care about liveness
+        // should also check loopCount > 0.
+        doc["tasks"][name]["staleMs"] = (t.lastTickMillis == 0) ? 0ULL : (nowMs - t.lastTickMillis);
+    };
+
+    addTask("mqtt", info.mqttTaskInfo);
+    addTask("mqttOta", info.mqttOtaTaskInfo);
+    addTask("customMqtt", info.customMqttTaskInfo);
+    addTask("customServerHealthCheck", info.customServerHealthCheckTaskInfo);
+    addTask("customServerOtaTimeout", info.customServerOtaTimeoutTaskInfo);
+    addTask("led", info.ledTaskInfo);
+    addTask("influxDb", info.influxDbTaskInfo);
+    addTask("crashMonitor", info.crashMonitorTaskInfo);
+    addTask("buttonHandler", info.buttonHandlerTaskInfo);
+    addTask("udpLog", info.udpLogTaskInfo);
+    addTask("customWifi", info.customWifiTaskInfo);
+    addTask("ade7953MeterReading", info.ade7953MeterReadingTaskInfo);
+    addTask("ade7953EnergySave", info.ade7953EnergySaveTaskInfo);
+    addTask("ade7953HourlyCsv", info.ade7953HourlyCsvTaskInfo);
+    addTask("maintenance", info.maintenanceTaskInfo);
+    addTask("issueRegistry", info.issueRegistryTaskInfo);
+
+    LOG_DEBUG("Dynamic system info converted to JSON");
+}
+
+void getJsonDeviceStaticInfo(JsonDocument &doc) {
+    SystemStaticInfo info;
+    populateSystemStaticInfo(info);
+    systemStaticInfoToJson(info, doc);
+}
+
+void getJsonDeviceDynamicInfo(JsonDocument &doc) {
+    SystemDynamicInfo info;
+    populateSystemDynamicInfo(info);
+    systemDynamicInfoToJson(info, doc);
+}
+
+bool safeSerializeJson(JsonDocument &jsonDocument, char* buffer, size_t bufferSize, bool truncateOnError) {
+    // Validate inputs
+    if (!buffer || bufferSize == 0) {
+        LOG_WARNING("Invalid buffer parameters passed to safeSerializeJson");
+        return false;
+    }
+
+    size_t size = measureJson(jsonDocument);
+    if (size >= bufferSize) {
+        if (truncateOnError) {
+            // Truncate JSON to fit buffer
+            serializeJson(jsonDocument, buffer, bufferSize);
+            // Ensure null-termination (avoid weird last character issues)
+            buffer[bufferSize - 1] = '\0';
+            
+            LOG_DEBUG("Truncating JSON to fit buffer size (%zu bytes vs %zu bytes)", bufferSize, size);
+        } else {
+            LOG_WARNING("JSON size (%zu bytes) exceeds buffer size (%zu bytes)", size, bufferSize);
+            snprintf(buffer, bufferSize, "%s", ""); // Clear buffer on failure
+        }
+        return false;
+    }
+
+    serializeJson(jsonDocument, buffer, bufferSize);
+    LOG_VERBOSE("JSON serialized successfully (bytes: %zu): %s", size, buffer);
+    return true;
+}
+
+// Task function that handles periodic maintenance checks
+static void _maintenanceTask(void* parameter) {
+    LOG_DEBUG("Maintenance task started");
+    
+    _maintenanceTaskShouldRun = true;
+    while (_maintenanceTaskShouldRun) {
+        TASK_HEARTBEAT(_maintenanceHeartbeat);
+
+        // Update and print statistics
+        printStatistics();
+        printDeviceStatusDynamic();
+
+        // Check heap memory
+        if (ESP.getFreeHeap() < MINIMUM_FREE_HEAP_SIZE) {
+            LOG_FATAL("Heap memory has degraded below safe minimum (%d bytes): %lu bytes", MINIMUM_FREE_HEAP_SIZE, ESP.getFreeHeap());
+            setRestartSystem("Heap memory has degraded below safe minimum");
+        }
+
+        // Check PSRAM memory
+        if (ESP.getFreePsram() < MINIMUM_FREE_PSRAM_SIZE) {
+            LOG_FATAL("PSRAM memory has degraded below safe minimum (%d bytes): %lu bytes", MINIMUM_FREE_PSRAM_SIZE, ESP.getFreePsram());
+            setRestartSystem("PSRAM memory has degraded below safe minimum");
+        }
+
+        // If the log file exceeds maximum size, clear it
+        size_t logSize = getLogFileSize();
+        if (logSize >= MAXIMUM_LOG_FILE_SIZE) {
+            AdvancedLogger::clearLogKeepLatestXPercent(10);
+            LOG_INFO("Log cleared due to size limit (size: %zu bytes, limit: %d bytes)", logSize, MAXIMUM_LOG_FILE_SIZE);
+        }
+
+        // Check LittleFS memory and clear log if needed
+        if (LittleFS.totalBytes() - LittleFS.usedBytes() < MINIMUM_FREE_LITTLEFS_SIZE) {
+            AdvancedLogger::clearLog(); // Here we clear all for safety
+            LOG_WARNING("Log cleared due to low LittleFS memory");
+        }
+        
+        LOG_DEBUG("Maintenance checks completed");
+
+        // Wait for stop notification with timeout (blocking)
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(MAINTENANCE_CHECK_INTERVAL)) > 0) {
+            _maintenanceTaskShouldRun = false;
+            break;
+        }
+    }
+
+    LOG_DEBUG("Maintenance task stopping");
+    
+    _maintenanceTaskHandle = NULL;
+    vTaskDelete(NULL);
+}
+
+void startMaintenanceTask() {
+    if (_maintenanceTaskHandle != NULL) {
+        LOG_DEBUG("Maintenance task is already running");
+        return;
+    }
+    
+    LOG_DEBUG("Starting maintenance task with %d bytes stack in internal RAM (performs flash I/O operations)", TASK_MAINTENANCE_STACK_SIZE);
+    
+    BaseType_t result = xTaskCreate(
+        _maintenanceTask,
+        TASK_MAINTENANCE_NAME,
+        TASK_MAINTENANCE_STACK_SIZE,
+        NULL,
+        TASK_MAINTENANCE_PRIORITY,
+        &_maintenanceTaskHandle);
+    
+    if (result != pdPASS) {
+        LOG_ERROR("Failed to create maintenance task");
+    }
+}
+
+size_t getLogFileSize() {
+    if (!LittleFS.exists(LOG_PATH)) {
+        return 0;
+    }
+    
+    File logFile = LittleFS.open(LOG_PATH, FILE_READ);
+    if (!logFile) {
+        LOG_WARNING("Failed to open log file to check size");
+        return 0;
+    }
+    
+    size_t size = logFile.size();
+    logFile.close();
+    
+    return size;
+}
+
+void stopTaskGracefully(TaskHandle_t* taskHandle, const char* taskName) {
+    if (!taskHandle || *taskHandle == NULL) {
+        LOG_DEBUG("%s was not running", taskName ? taskName : "Task");
+        return;
+    }
+
+    LOG_DEBUG("Stopping %s...", taskName ? taskName : "task");
+    
+    xTaskNotifyGive(*taskHandle);
+    
+    // Wait with timeout for clean shutdown
+    int32_t timeout = TASK_STOPPING_TIMEOUT;
+    uint32_t loops = 0;
+    while (*taskHandle != NULL && timeout > 0 && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        delay(TASK_STOPPING_CHECK_INTERVAL);
+        timeout -= TASK_STOPPING_CHECK_INTERVAL;
+    }
+    
+    // Force cleanup if needed
+    if (*taskHandle != NULL) {
+        LOG_WARNING("Force stopping %s", taskName ? taskName : "task");
+        vTaskDelete(*taskHandle);
+        *taskHandle = NULL;
+    } else {
+        LOG_DEBUG("%s stopped successfully", taskName ? taskName : "Task");
+    }
+}
+
+void stopMaintenanceTask() {
+    stopTaskGracefully(&_maintenanceTaskHandle, "maintenance task");
+}
+
+TaskInfo getMaintenanceTaskInfo()
+{
+    return getTaskInfoSafely(_maintenanceTaskHandle, TASK_MAINTENANCE_STACK_SIZE, &_maintenanceHeartbeat);
+}
+
+// Failsafe timer callback - runs from esp_timer task context, guaranteed to execute
+// even if all other tasks are blocked/deadlocked
+static void _failsafeRestartCallback(void* parameter) {
+    // Don't log here - we're in timer context and logging might be what's blocked
+    ESP.restart();
+}
+
+// Start the failsafe timer that guarantees restart even if something blocks
+static void _startFailsafeTimer() {
+    // Ensure only one timer is running
+    if (_failsafeTimer != NULL) return;
+
+    const esp_timer_create_args_t timerArgs = {
+        .callback = _failsafeRestartCallback,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = SYSTEM_RESTART_FAILSAFE_TIMER_NAME,
+        .skip_unhandled_events = true
+    };
+    if (esp_timer_create(&timerArgs, &_failsafeTimer) == ESP_OK) {
+        esp_timer_start_once(_failsafeTimer, SYSTEM_RESTART_FAILSAFE_TIMEOUT * 1000ULL); // Convert ms to us
+        char failsafeHuman[DURATION_FORMAT_BUFFER_SIZE];
+        DurationFormat::humanizeDuration((uint64_t)SYSTEM_RESTART_FAILSAFE_TIMEOUT, failsafeHuman, sizeof(failsafeHuman));
+        LOG_DEBUG("Failsafe restart timer started (%s)", failsafeHuman);
+    } else {
+        LOG_WARNING("Failed to create failsafe timer - restart may hang if blocked");
+    }
+}
+
+// Restart task - handles service shutdown and restart (failsafe timer protects this from blocking)
+static void _restartTask(void* parameter) {
+    bool factoryReset = (bool)(uintptr_t)parameter;
+
+    LOG_DEBUG("Restart task started%s", factoryReset ? " (factory reset)" : "");
+
+    // 1. Visual indicator
+    Led::setBrightness(max(Led::getBrightness(), (uint8_t)1));
+    Led::setOrange(Led::PRIO_CRITICAL);
+
+    // 2. Stop all services (best effort, don't wait forever for each)
+    LOG_DEBUG("Stopping services before restart...");
+    IssueRegistry::stop();
+    CustomServer::stop();
+    Ade7953::stop();
+    ModbusTcp::stop();
+    if (!globalCommunityMode) Mqtt::stop();
+    LOG_DEBUG("Services stopped");
+
+    // 3. Close log file (if this blocks, failsafe timer will restart us)
+    AdvancedLogger::end();
+
+    // 4. Factory reset if requested
+    LOG_INFO("Restarting system%s", factoryReset ? ". Factory reset requested" : "");
+    if (factoryReset) { _factoryReset(); }
+
+    // 5. Normal restart - if we get here, great. If not, failsafe timer handles it.
+    ESP.restart();
+
+    // Should never reach here
+    vTaskDelete(NULL);
+}
+
+bool setRestartSystem(const char* reason, bool factoryReset) {
+    LOG_INFO("Restart required for reason: %s%s", reason, factoryReset ? ". Factory reset required" : "");
+
+    // Check if we can restart now (safe mode protection)
+    if (!CrashMonitor::canRestartNow()) {
+        uint32_t remainingMs = CrashMonitor::getMinimumUptimeRemaining();
+        uint32_t remainingSec = remainingMs / 1000;
+        
+        if (CrashMonitor::isInSafeMode()) {
+            LOG_FATAL(
+                "SAFE MODE: Restart blocked for %lu s to prevent infinite loops. "
+                "Reason: %s. WiFi/OTA active for remote recovery", 
+                remainingSec, reason
+            );
+        } else {
+            LOG_WARNING(
+                "Restart delayed: minimum uptime not reached (%lu s remaining to "
+                "prevent rapid restart loops)", 
+                remainingSec
+            );
+        }
+        
+        return false;
+    }
+
+    if (_restartTaskHandle != NULL) {
+        LOG_INFO("A restart is already scheduled. Keeping the existing one.");
+        return false;
+    }
+
+    // START FAILSAFE TIMER FIRST - guarantees restart even if task creation or execution fails
+    _startFailsafeTimer();
+
+    // Create task to handle graceful shutdown and restart
+    BaseType_t result = xTaskCreate(
+        _restartTask,
+        TASK_RESTART_NAME,
+        TASK_RESTART_STACK_SIZE,
+        (void*)(uintptr_t)factoryReset,
+        TASK_RESTART_PRIORITY,
+        &_restartTaskHandle);
+
+    if (result != pdPASS) {
+        // Task creation failed, but failsafe timer is already running
+        LOG_ERROR("Failed to create restart task - failsafe timer will restart system");
+    }
+
+    return true;
+}
+
+// Print functions
+// -----------------------------
+
+void printDeviceStatusStatic()
+{
+    SystemStaticInfo *info = (SystemStaticInfo*)ps_malloc(sizeof(SystemStaticInfo));
+    if (!info) {
+        LOG_ERROR("Failed to allocate SystemStaticInfo in PSRAM");
+        return;
+    }
+    
+    populateSystemStaticInfo(*info);
+
+    LOG_DEBUG("--- Static System Info ---");
+    LOG_DEBUG("Product: %s (%s)", info->fullProductName, info->productName);
+    LOG_DEBUG("Company: %s | Author: %s", info->companyName, info->author);
+    LOG_DEBUG("Firmware: %s | Build: %s %s", info->buildVersion, info->buildDate, info->buildTime);
+    LOG_DEBUG("Sketch MD5: %s | Partition app name: %s", info->sketchMD5, info->partitionAppName);
+    LOG_DEBUG("Flash: %lu bytes, %lu Hz | PSRAM: %lu bytes", info->flashChipSizeBytes, info->flashChipSpeedHz, info->psramSizeBytes);
+    LOG_DEBUG("Chip: %s, rev %u, cores %u, id 0x%llx, CPU: %lu MHz", info->chipModel, info->chipRevision, info->chipCores, info->chipId, info->cpuFrequencyMHz);
+    LOG_DEBUG("SDK: %s | Core: %s", info->sdkVersion, info->coreVersion);
+    LOG_DEBUG("Device ID: %s", info->deviceId);
+    LOG_DEBUG("Monitoring: %lu crashes (%lu consecutive), %lu resets (%lu consecutive) | Last reset: %s", info->crashCount, info->consecutiveCrashCount, info->resetCount, info->consecutiveResetCount, info->lastResetReasonString);
+
+    free(info);
+    LOG_DEBUG("------------------------");
+}
+
+void printDeviceStatusDynamic()
+{
+    SystemDynamicInfo *info = (SystemDynamicInfo*)ps_malloc(sizeof(SystemDynamicInfo));
+    if (!info) {
+        LOG_ERROR("Failed to allocate SystemDynamicInfo in PSRAM");
+        return;
+    }
+    
+    populateSystemDynamicInfo(*info);
+
+    LOG_DEBUG("--- Dynamic System Info ---");
+    char uptimeHuman[DURATION_FORMAT_BUFFER_SIZE];
+    DurationFormat::humanizeDuration(info->uptimeMilliseconds, uptimeHuman, sizeof(uptimeHuman));
+    LOG_DEBUG(
+        "Uptime: %s | Timestamp: %s | Temperature: %.2f C",
+        uptimeHuman, info->currentTimestampIso, info->temperatureCelsius
+    );
+
+    LOG_DEBUG("Heap: %lu total, %lu free (%.1f%%), %lu used (%.1f%%), %lu min free, %lu max alloc",  
+        info->heapTotalBytes, 
+        info->heapFreeBytes, info->heapFreePercentage, 
+        info->heapUsedBytes, info->heapUsedPercentage, 
+        info->heapMinFreeBytes, info->heapMaxAllocBytes
+    );
+    if (info->psramFreeBytes > 0 || info->psramUsedBytes > 0) {
+        LOG_DEBUG("PSRAM: %lu total, %lu free (%.1f%%), %lu used (%.1f%%), %lu min free, %lu max alloc", 
+            info->psramTotalBytes,
+            info->psramFreeBytes, info->psramFreePercentage, 
+            info->psramUsedBytes, info->psramUsedPercentage, 
+            info->psramMinFreeBytes, info->psramMaxAllocBytes
+        );
+    }
+    LOG_DEBUG("LittleFS: %lu total, %lu free (%.1f%%), %lu used (%.1f%%)",  
+        info->littlefsTotalBytes, 
+        info->littlefsFreeBytes, info->littlefsFreePercentage, 
+        info->littlefsUsedBytes, info->littlefsUsedPercentage
+    );
+    LOG_DEBUG("NVS: %lu total, %lu free (%.1f%%), %lu used (%.1f%%), %u namespaces",  
+        info->totalUsableEntries, info->availableEntries, info->availableEntriesPercentage, 
+        info->usedEntries, info->usedEntriesPercentage, info->namespaceCount
+    );
+
+    if (info->wifiConnected) {
+        LOG_DEBUG("WiFi: Connected to '%s' (BSSID: %s) | RSSI %ld dBm | MAC %s", info->wifiSsid, info->wifiBssid, info->wifiRssi, info->wifiMacAddress);
+        LOG_DEBUG("WiFi: IP %s | Gateway %s | DNS %s | Subnet %s", info->wifiLocalIp, info->wifiGatewayIp, info->wifiDnsIp, info->wifiSubnetMask);
+    } else {
+        LOG_DEBUG("WiFi: Disconnected | MAC %s", info->wifiMacAddress);
+    }
+
+    free(info);
+    LOG_DEBUG("-------------------------");
+}
+
+void updateStatistics() {
+    // The only statistic which is (currently) updated manually here is the log count
+    statistics.logVerbose = AdvancedLogger::getVerboseCount();
+    statistics.logDebug = AdvancedLogger::getDebugCount();
+    statistics.logInfo = AdvancedLogger::getInfoCount();
+    statistics.logWarning = AdvancedLogger::getWarningCount();
+    statistics.logError = AdvancedLogger::getErrorCount();
+    statistics.logFatal = AdvancedLogger::getFatalCount();
+    statistics.logDropped = AdvancedLogger::getDroppedCount();
+
+    LOG_DEBUG("Statistics updated");
+}
+
+void printStatistics() {
+    updateStatistics();
+
+    LOG_DEBUG("--- Statistics ---");
+    LOG_DEBUG("Statistics - ADE7953: %llu total interrupts | %llu handled interrupts | %llu readings | %llu reading failures",  
+        statistics.ade7953TotalInterrupts, 
+        statistics.ade7953TotalHandledInterrupts, 
+        statistics.ade7953ReadingCount, 
+        statistics.ade7953ReadingCountFailure
+    );
+
+    LOG_DEBUG("Statistics - MQTT: %llu messages published | %llu errors | %llu connections | %llu connection errors",  
+        statistics.mqttMessagesPublished, 
+        statistics.mqttMessagesPublishedError,
+        statistics.mqttConnections,
+        statistics.mqttConnectionErrors
+    );
+
+    LOG_DEBUG("Statistics - Custom MQTT: %llu messages published | %llu errors",  
+        statistics.customMqttMessagesPublished, 
+        statistics.customMqttMessagesPublishedError
+    );
+
+    LOG_DEBUG("Statistics - Modbus: %llu requests | %llu errors",  
+        statistics.modbusRequests, 
+        statistics.modbusRequestsError
+    );
+
+    LOG_DEBUG("Statistics - InfluxDB: %llu uploads | %llu errors",  
+        statistics.influxdbUploadCount, 
+        statistics.influxdbUploadCountError
+    );
+
+    LOG_DEBUG("Statistics - WiFi: %llu connections | %llu errors",  
+        statistics.wifiConnection, 
+        statistics.wifiConnectionError
+    );
+
+    LOG_DEBUG("Statistics - Web Server: %llu requests | %llu errors",  
+        statistics.webServerRequests, 
+        statistics.webServerRequestsError
+    );
+
+    LOG_DEBUG("Statistics - Log: %llu verbose | %llu debug | %llu info | %llu warning | %llu error | %llu fatal, %llu dropped",
+        statistics.logVerbose, 
+        statistics.logDebug, 
+        statistics.logInfo, 
+        statistics.logWarning, 
+        statistics.logError, 
+        statistics.logFatal,
+        statistics.logDropped
+    );
+    LOG_DEBUG("-------------------");
+}
+
+void statisticsToJson(Statistics& statistics, JsonDocument &jsonDocument) {
+    // Update to have latest values
+    updateStatistics();
+
+    // ADE7953 statistics
+    jsonDocument["ade7953"]["totalInterrupts"] = statistics.ade7953TotalInterrupts;
+    jsonDocument["ade7953"]["totalHandledInterrupts"] = statistics.ade7953TotalHandledInterrupts;
+    jsonDocument["ade7953"]["readingCount"] = statistics.ade7953ReadingCount;
+    jsonDocument["ade7953"]["readingCountFailure"] = statistics.ade7953ReadingCountFailure;
+
+    // MQTT statistics
+    jsonDocument["mqtt"]["messagesPublished"] = statistics.mqttMessagesPublished;
+    jsonDocument["mqtt"]["messagesPublishedError"] = statistics.mqttMessagesPublishedError;
+    jsonDocument["mqtt"]["connections"] = statistics.mqttConnections;
+    jsonDocument["mqtt"]["connectionErrors"] = statistics.mqttConnectionErrors;
+
+    // Custom MQTT statistics
+    jsonDocument["customMqtt"]["messagesPublished"] = statistics.customMqttMessagesPublished;
+    jsonDocument["customMqtt"]["messagesPublishedError"] = statistics.customMqttMessagesPublishedError;
+
+    // Modbus statistics
+    jsonDocument["modbus"]["requests"] = statistics.modbusRequests;
+    jsonDocument["modbus"]["requestsError"] = statistics.modbusRequestsError;
+
+    // InfluxDB statistics
+    jsonDocument["influxdb"]["uploadCount"] = statistics.influxdbUploadCount;
+    jsonDocument["influxdb"]["uploadCountError"] = statistics.influxdbUploadCountError;
+
+    // WiFi statistics
+    jsonDocument["wifi"]["connection"] = statistics.wifiConnection;
+    jsonDocument["wifi"]["connectionError"] = statistics.wifiConnectionError;
+
+    // Web Server statistics
+    jsonDocument["webServer"]["requests"] = statistics.webServerRequests;
+    jsonDocument["webServer"]["requestsError"] = statistics.webServerRequestsError;
+
+    // Log statistics
+    jsonDocument["log"]["verbose"] = statistics.logVerbose;
+    jsonDocument["log"]["debug"] = statistics.logDebug;
+    jsonDocument["log"]["info"] = statistics.logInfo;
+    jsonDocument["log"]["warning"] = statistics.logWarning;
+    jsonDocument["log"]["error"] = statistics.logError;
+    jsonDocument["log"]["fatal"] = statistics.logFatal;
+    jsonDocument["log"]["dropped"] = statistics.logDropped;
+
+    LOG_VERBOSE("Statistics converted to JSON");
+}
+
+// Helper functions
+// -----------------------------
+
+static void _factoryReset() { // No logger here it is likely destroyed already
+    Serial.println("[WARNING] Factory reset requested");
+
+    Led::setBrightness(max(Led::getBrightness(), (uint8_t)1)); // Show a faint light even if it is off
+    Led::blinkRedFast(Led::PRIO_CRITICAL);
+
+    clearAllPreferences();
+
+    Serial.println("[WARNING] Formatting LittleFS. This will take some time.");
+    LittleFS.format();
+
+    // Removed ESP.restart() call since the factory reset must be called only from the restart task
+}
+
+bool isFirstBootDone() {
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE_GENERAL, true)) {
+        LOG_DEBUG("Could not open preferences namespace: %s. Assuming first boot", PREFERENCES_NAMESPACE_GENERAL);
+        return false;
+    }
+    bool firstBoot = preferences.getBool(IS_FIRST_BOOT_DONE_KEY, false);
+    preferences.end();
+
+    return firstBoot;
+}
+
+void setFirstBootDone() { // No arguments because the only way to set first boot done to false it through a complete wipe - thus automatically setting it to "false"
+    Preferences preferences;
+    if (!preferences.begin(PREFERENCES_NAMESPACE_GENERAL, false)) {
+        LOG_ERROR("Failed to open preferences namespace: %s", PREFERENCES_NAMESPACE_GENERAL);
+        return;
+    }
+    preferences.putBool(IS_FIRST_BOOT_DONE_KEY, true);
+    preferences.end();
+}
+
+void createAllNamespaces() {
+    // Initialize all known app namespaces on first boot
+    const char* namespacesToCreate[] = {TO_INITIALIZE_NVS_NAMESPACES_LIST};
+
+    Preferences preferences;
+    for (const char* ns : namespacesToCreate) {
+        preferences.begin(ns, false);
+        preferences.end();
+    }
+
+    LOG_DEBUG("All namespaces created");
+}
+
+void clearAllPreferences() {
+    // Clear all app namespaces during factory reset, skipping only critical ones
+    // Critical namespaces: factory-provisioned data (certs, calibration) and device-specific data
+    const char* excludedNamespaces[] = {EXCLUDED_NVS_NAMESPACES_LIST};
+
+    nvs_iterator_t it = nullptr;
+    esp_err_t err = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY, &it);
+
+    if (err != ESP_OK) {
+        LOG_WARNING("Could not initialize NVS iterator for clearing preferences (error %d)", err);
+        return;
+    }
+
+    Preferences preferences;
+    uint32_t clearedCount = 0;
+
+    uint32_t loops = 0;
+    while (err == ESP_OK && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        // Skip system namespaces (handled separately by ESP)
+        // Most likely they would be already handled by excludedNamespaces, but better safe than sorry
+        if (strncmp(info.namespace_name, "nvs.", 4) == 0) {
+            err = nvs_entry_next(&it);
+            continue;
+        }
+
+        // Check if this namespace should be skipped (critical data)
+        bool isExcluded = false;
+        for (const char* excluded : excludedNamespaces) {
+            if (strcmp(info.namespace_name, excluded) == 0) {
+                isExcluded = true;
+                break;
+            }
+        }
+
+        // Clear non-critical namespaces
+        if (!isExcluded && preferences.begin(info.namespace_name, false)) {
+            preferences.clear();
+            preferences.end();
+            clearedCount++;
+        }
+
+        err = nvs_entry_next(&it);
+
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+            LOG_ERROR("Could not advance NVS iterator (error %d)", err);
+            break;
+        }
+    }
+
+    if (it != nullptr) {
+        nvs_release_iterator(it);
+    }
+
+    LOG_WARNING("Cleared %ld preferences (factory/device-specific data preserved)", clearedCount);
+}
+
+void getDeviceId(char* deviceId, size_t maxLength) {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    
+    // Use lowercase hex formatting without colons
+    snprintf(deviceId, maxLength, "%02x%02x%02x%02x%02x%02x", 
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+
+uint64_t calculateExponentialBackoff(uint64_t attempt, uint64_t initialInterval, uint64_t maxInterval, uint64_t multiplier) {
+    if (attempt == 0) return 0;
+    
+    // Direct calculation using bit shifting for power of 2 multipliers
+    if (multiplier == 2) {
+        // For multiplier=2, use bit shifting: delay = initial * 2^(attempt-1)
+        if (attempt >= 64) return maxInterval; // Prevent overflow
+        uint64_t backoffDelay = initialInterval << (attempt - 1);
+        return min(backoffDelay, maxInterval);
+    }
+    
+    // General case: calculate multiplier^(attempt-1)
+    uint64_t backoffDelay = initialInterval;
+    for (uint64_t i = 1; i < attempt; ++i) {
+        // Check for overflow before multiplication
+        if (backoffDelay > maxInterval / multiplier) {
+            return maxInterval;
+        }
+        backoffDelay *= multiplier;
+    }
+    
+    return min(backoffDelay, maxInterval);
+}
+    
+// === LittleFS FILE OPERATIONS ===
+
+bool listLittleFsFiles(JsonDocument &doc, const char* folderPath) {
+    if (folderPath && strlen(folderPath) > 0) {
+        // Ensure folder path starts with /
+        char normalizedPath[NAME_BUFFER_SIZE];
+        if (folderPath[0] != '/') {
+            snprintf(normalizedPath, sizeof(normalizedPath), "/%s", folderPath);
+        } else {
+            snprintf(normalizedPath, sizeof(normalizedPath), "%s", folderPath);
+        }
+        
+        // Check if the folder exists
+        if (!LittleFS.exists(normalizedPath)) {
+            LOG_DEBUG("Folder does not exist: %s", normalizedPath);
+            return true; // Return true with empty doc - not an error
+        }
+        
+        return _listLittleFsFilesRecursive(doc, normalizedPath, normalizedPath, 0);
+    }
+    return _listLittleFsFilesRecursive(doc, "/", nullptr, 0);
+}
+
+static bool _listLittleFsFilesRecursive(JsonDocument &doc, const char* dirname, const char* basePath, uint8_t levels) {
+    File root = LittleFS.open(dirname);
+    if (!root) {
+        LOG_ERROR("Failed to open LittleFS directory: %s", dirname);
+        return false;
+    }
+    
+    if (!root.isDirectory()) {
+        LOG_ERROR("Path is not a directory: %s", dirname);
+        root.close();
+        return false;
+    }
+
+    File file = root.openNextFile();
+    uint32_t loops = 0;
+    
+    while (file && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        const char* filepath = file.path();
+
+        if (file.isDirectory()) {
+            // Recursively list subdirectory contents (limit depth to prevent infinite recursion)
+            if (levels < 5) {
+                _listLittleFsFilesRecursive(doc, filepath, basePath, levels + 1);
+            }
+        } else {
+            const char* displayPath = filepath;
+            
+            // If we have a basePath, make paths relative to it
+            if (basePath) {
+                size_t baseLen = strlen(basePath);
+                if (strncmp(filepath, basePath, baseLen) == 0) {
+                    displayPath = filepath + baseLen;
+                    // Skip leading slash after base path
+                    if (displayPath[0] == '/') displayPath++;
+                }
+            } else {
+                // Remove leading slash for consistency (global listing)
+                if (filepath[0] == '/') displayPath++;
+            }
+            
+            // Add file with its size to the JSON document
+            doc[displayPath] = file.size();
+        }
+        
+        file = root.openNextFile();
+    }
+
+    root.close();
+    return true;
+}
+
+bool getLittleFsFileContent(const char* filepath, char* buffer, size_t bufferSize) {
+    if (!filepath || !buffer || bufferSize == 0) {
+        LOG_ERROR("Invalid arguments provided");
+        return false;
+    }
+    
+    // Check if file exists
+    if (!LittleFS.exists(filepath)) {
+        LOG_DEBUG("File not found: %s", filepath);
+        return false;
+    }
+    
+    File file = LittleFS.open(filepath, FILE_READ);
+    if (!file) {
+        LOG_ERROR("Failed to open file: %s", filepath);
+        return false;
+    }
+
+    size_t bytesRead = file.readBytes(buffer, bufferSize - 1);
+    buffer[bytesRead] = '\0';  // Null-terminate the string
+    file.close();
+
+    LOG_DEBUG("Successfully read file: %s (%d bytes)", filepath, bytesRead);
+    return true;
+}
+
+const char* getContentTypeFromFilename(const char* filename) {
+    if (!filename) return "application/octet-stream";
+    
+    // Find the file extension
+    const char* ext = strrchr(filename, '.');
+    if (!ext) return "application/octet-stream";
+    
+    // Convert to lowercase for comparison
+    char extension[16];
+    size_t extLen = strlen(ext);
+    if (extLen >= sizeof(extension)) return "application/octet-stream";
+    
+    for (size_t i = 0; i < extLen; i++) {
+        extension[i] = (char)tolower(ext[i]);
+    }
+    extension[extLen] = '\0';
+    
+    // Common file types used in the project
+    if (strcmp(extension, ".json") == 0) return "application/json";
+    if (strcmp(extension, ".txt") == 0) return "text/plain";
+    if (strcmp(extension, ".log") == 0) return "text/plain";
+    if (strcmp(extension, ".csv") == 0) return "text/csv";
+    if (strcmp(extension, ".xml") == 0) return "application/xml";
+    if (strcmp(extension, ".html") == 0) return "text/html";
+    if (strcmp(extension, ".css") == 0) return "text/css";
+    if (strcmp(extension, ".js") == 0) return "application/javascript";
+    if (strcmp(extension, ".bin") == 0) return "application/octet-stream";
+    if (strcmp(extension, ".gz") == 0) return "application/gzip";
+    if (strcmp(extension, ".tar") == 0) return "application/x-tar";
+    
+    return "application/octet-stream";
+}
+
+bool compressFile(const char* filepath) {
+    if (!filepath) {
+        LOG_ERROR("Invalid file path");
+        return false;
+    }
+
+    char sourcePath[NAME_BUFFER_SIZE];
+    char destinationPath[NAME_BUFFER_SIZE + 3];      // Plus .gz
+    char tempPath[NAME_BUFFER_SIZE + 7];      // Plus .gz.tmp
+
+    snprintf(sourcePath, sizeof(sourcePath), "%s", filepath);
+    snprintf(destinationPath, sizeof(destinationPath), "%s.gz", sourcePath);
+    snprintf(tempPath, sizeof(tempPath), "%s.gz.tmp", sourcePath);
+
+    if (!LittleFS.exists(sourcePath)) {
+        LOG_WARNING("No finished csv to compress: %s", sourcePath);
+        return false;
+    }
+
+    // Remove any existing .gz.tmp file before starting
+    if (LittleFS.exists(tempPath)) {
+        LOG_DEBUG("Found existing temp file %s. Removing it", tempPath);
+        if (!LittleFS.remove(tempPath)) {
+            LOG_ERROR("Failed to remove existing temp file: %s", tempPath);
+            return false;
+        }
+    }
+
+    // Remove any existing .gz file before renaming (atomic replace)
+    if (LittleFS.exists(destinationPath)) {
+        LOG_DEBUG("Found existing compressed file %s. Removing it", destinationPath);
+        if (!LittleFS.remove(destinationPath)) {
+            LOG_ERROR("Failed to remove existing compressed file: %s", destinationPath);
+            return false;
+        }
+    }
+
+    File srcFile = LittleFS.open(sourcePath, FILE_READ);
+    if (!srcFile) {
+        LOG_ERROR("Failed to open source file: %s", sourcePath);
+        return false;
+    }
+    size_t sourceSize = srcFile.size();
+
+    File tempFile = LittleFS.open(tempPath, FILE_WRITE);
+    if (!tempFile) {
+        LOG_ERROR("Failed to open temporary file: %s", tempPath);
+        srcFile.close();
+        return false;
+    }
+
+    size_t compressedSize = LZPacker::compress(&srcFile, sourceSize, &tempFile);
+    srcFile.close();
+    tempFile.close();
+    
+    if (compressedSize > 0) {
+        LOG_DEBUG("Compressed finished CSV %s (%zu bytes) -> %s (%zu bytes)", sourcePath, sourceSize, tempPath, compressedSize);
+
+        // Rename temp file to final .gz name
+        if (!LittleFS.rename(tempPath, destinationPath)) {
+            LOG_ERROR("Failed to rename temporary file %s to final %s", tempPath, destinationPath);
+            // Clean up temp file
+            LittleFS.remove(tempPath);
+            return false;
+        }
+
+        if (!LittleFS.remove(sourcePath)) {
+            LOG_WARNING("Could not delete original %s after compression", sourcePath);
+            return false; // Compression succeeded, but cleanup failed - treat as failure
+        }
+    } else {
+        LOG_ERROR("Failed to compress finished CSV %s", sourcePath);
+        // Clean up temp file if created
+        LittleFS.remove(tempPath);
+        return false;
+    }
+
+    LOG_DEBUG("Successfully compressed %s (%zu bytes) to %s (%zu bytes)", sourcePath, sourceSize, destinationPath, compressedSize);
+    return true;
+}
+
+void migrateCsvToGzip(const char* dirPath, const char* excludePrefix) {
+    LOG_DEBUG("Starting CSV -> gzip migration in %s", dirPath);
+
+    if (!LittleFS.exists(dirPath)) {
+        LOG_DEBUG("Energy folder not present, nothing to migrate");
+        return;
+    }
+
+    File dir = LittleFS.open(dirPath);
+    if (!dir) {
+        LOG_WARNING("Cannot open dir %s", dirPath);
+        return;
+    }
+    dir.rewindDirectory();
+
+    File file = dir.openNextFile();
+    uint32_t loops = 0;
+    while (file && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        if (!file.isDirectory()) {
+            const char* path = file.name();
+            char fullPath[NAME_BUFFER_SIZE];
+            snprintf(fullPath, sizeof(fullPath), "%s/%s", dirPath, path);
+
+            if (excludePrefix && startsWith(fullPath, excludePrefix)) {
+                LOG_DEBUG("Skipping file %s due to exclude prefix", fullPath);
+                file.close(); // Close file handle before continuing
+                file = dir.openNextFile();
+                continue;
+            }
+
+            if (endsWith(fullPath, ".csv")) {
+                file.close(); // Close file handle before attempting compression/deletion
+                LOG_DEBUG("Migrating %s -> %s.gz", fullPath, fullPath);
+                if (compressFile(fullPath)) {
+                    LOG_INFO("Compressed and removed original %s", fullPath);
+                } else {
+                    LOG_ERROR("Compression failed for %s", fullPath);
+                }
+            } else {
+                file.close(); // Close file handle if not processing
+            }
+        } else {
+            file.close(); // Close directory handle
+        }
+        file = dir.openNextFile();
+    }
+    dir.close();
+
+    LOG_DEBUG("CSV -> gzip migration finished");
+}
+
+// === ENERGY FILE CONSOLIDATION ===
+
+static bool _ensureDirectoryExists(const char* dirPath) {
+    if (LittleFS.exists(dirPath)) return true;
+    
+    if (LittleFS.mkdir(dirPath)) {
+        LOG_DEBUG("Created directory: %s", dirPath);
+        return true;
+    }
+    
+    LOG_ERROR("Failed to create directory: %s", dirPath);
+    return false;
+}
+
+static bool _decompressGzipFile(const char* gzPath, const char* outputPath) {
+    if (!LittleFS.exists(gzPath)) {
+        LOG_WARNING("Gzip file not found: %s", gzPath);
+        return false;
+    }
+    
+    GzUnpacker *unpacker = new GzUnpacker();
+    if (!unpacker) {
+        LOG_ERROR("Failed to allocate GzUnpacker");
+        return false;
+    }
+    
+    unpacker->haltOnError(false);
+    
+    bool success = unpacker->gzExpander(LittleFS, gzPath, LittleFS, outputPath);
+    if (!success) {
+        LOG_ERROR("Failed to decompress %s (error %d)", gzPath, unpacker->tarGzGetError());
+    }
+    
+    delete unpacker;
+    return success;
+}
+
+static bool _appendFileToFile(const char* srcPath, File &destFile, bool skipHeader) {
+    File srcFile = LittleFS.open(srcPath, FILE_READ);
+    if (!srcFile) {
+        LOG_ERROR("Failed to open source file: %s", srcPath);
+        return false;
+    }
+    
+    // Skip header line if requested
+    if (skipHeader && srcFile.available()) {
+        // Read and discard the first line (header)
+        uint32_t loops = 0;
+        while (srcFile.available() && loops < MAX_LOOP_ITERATIONS) {
+            loops++;
+            int c = srcFile.read();
+            if (c == '\n') break;
+        }
+    }
+
+    // Copy remaining content
+    uint8_t buffer[512];
+    uint32_t loops = 0;
+    while (srcFile.available() && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        size_t bytesRead = srcFile.read(buffer, sizeof(buffer));
+        if (bytesRead > 0) {
+            destFile.write(buffer, bytesRead);
+        }
+    }
+    
+    srcFile.close();
+    return true;
+}
+
+bool migrateEnergyFilesToDailyFolder() {
+    LOG_DEBUG("Starting energy files migration to daily folder");
+    
+    // Ensure base energy directory exists
+    if (!_ensureDirectoryExists(ENERGY_CSV_PREFIX)) return false;
+    
+    // Check if there are any files in the root energy folder to migrate
+    File dir = LittleFS.open(ENERGY_CSV_PREFIX);
+    if (!dir) {
+        LOG_DEBUG("Energy folder not present, nothing to migrate");
+        return true;
+    }
+    
+    // Ensure daily subdirectory exists
+    if (!_ensureDirectoryExists(ENERGY_CSV_DAILY_PREFIX)) {
+        dir.close();
+        return false;
+    }
+    
+    dir.rewindDirectory();
+    uint32_t migratedCount = 0;
+    uint32_t loops = 0;
+    
+    File file = dir.openNextFile();
+    while (file && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        
+        if (!file.isDirectory()) {
+            const char* filename = file.name();
+            
+            // Only migrate .csv.gz files (daily energy files)
+            if (endsWith(filename, ".csv.gz")) {
+                char srcPath[NAME_BUFFER_SIZE];
+                char destPath[NAME_BUFFER_SIZE];
+                snprintf(srcPath, sizeof(srcPath), "%s/%s", ENERGY_CSV_PREFIX, filename);
+                snprintf(destPath, sizeof(destPath), "%s/%s", ENERGY_CSV_DAILY_PREFIX, filename);
+                
+                file.close(); // Close before rename
+                
+                if (LittleFS.rename(srcPath, destPath)) {
+                    LOG_DEBUG("Migrated %s -> %s", srcPath, destPath);
+                    migratedCount++;
+                } else {
+                    LOG_ERROR("Failed to migrate %s", srcPath);
+                }
+                
+                file = dir.openNextFile();
+                continue;
+            }
+            // Also migrate uncompressed .csv files (except today's)
+            else if (endsWith(filename, ".csv")) {
+                char srcPath[NAME_BUFFER_SIZE];
+                char destPath[NAME_BUFFER_SIZE];
+                snprintf(srcPath, sizeof(srcPath), "%s/%s", ENERGY_CSV_PREFIX, filename);
+                snprintf(destPath, sizeof(destPath), "%s/%s", ENERGY_CSV_DAILY_PREFIX, filename);
+                
+                file.close(); // Close before rename
+                
+                if (LittleFS.rename(srcPath, destPath)) {
+                    LOG_DEBUG("Migrated %s -> %s", srcPath, destPath);
+                    migratedCount++;
+                } else {
+                    LOG_ERROR("Failed to migrate %s", srcPath);
+                }
+                
+                file = dir.openNextFile();
+                continue;
+            }
+        }
+        
+        file.close();
+        file = dir.openNextFile();
+    }
+    
+    dir.close();
+    
+    if (migratedCount > 0) {
+        LOG_INFO("Migrated %lu energy files to daily folder", migratedCount);
+    } else {
+        LOG_DEBUG("No energy files needed migration");
+    }
+    
+    return true;
+}
+
+bool consolidateDailyFilesToMonthly(const char* yearMonth, const char* excludeDate) {
+    if (!yearMonth || strlen(yearMonth) != 7) { // Format: YYYY-MM
+        LOG_ERROR("Invalid yearMonth format: %s (expected YYYY-MM)", yearMonth ? yearMonth : "null");
+        return false;
+    }
+    
+    LOG_DEBUG("Starting daily -> monthly consolidation for %s (excluding: %s)", yearMonth, excludeDate ? excludeDate : "none");
+    
+    // Ensure monthly directory exists
+    if (!_ensureDirectoryExists(ENERGY_CSV_MONTHLY_PREFIX)) return false;
+    
+    // Check if daily folder exists
+    if (!LittleFS.exists(ENERGY_CSV_DAILY_PREFIX)) {
+        LOG_DEBUG("Daily folder does not exist, nothing to consolidate");
+        return true;
+    }
+    
+    // Prepare paths
+    char monthlyTempPath[NAME_BUFFER_SIZE];
+    char monthlyFinalPath[NAME_BUFFER_SIZE];
+    char monthlyGzPath[NAME_BUFFER_SIZE];
+    char monthlyGzTempPath[NAME_BUFFER_SIZE];
+    snprintf(monthlyTempPath, sizeof(monthlyTempPath), "%s/%s.csv.tmp", ENERGY_CSV_MONTHLY_PREFIX, yearMonth);
+    snprintf(monthlyFinalPath, sizeof(monthlyFinalPath), "%s/%s.csv", ENERGY_CSV_MONTHLY_PREFIX, yearMonth);
+    snprintf(monthlyGzPath, sizeof(monthlyGzPath), "%s/%s.csv.gz", ENERGY_CSV_MONTHLY_PREFIX, yearMonth);
+    snprintf(monthlyGzTempPath, sizeof(monthlyGzTempPath), "%s/%s.csv.gz.tmp", ENERGY_CSV_MONTHLY_PREFIX, yearMonth);
+    
+    // Check if monthly archive already exists - we'll need to decompress and append
+    bool existingArchive = LittleFS.exists(monthlyGzPath);
+    if (existingArchive) {
+        LOG_DEBUG("Monthly archive already exists for %s, will append new daily files", yearMonth);
+    }
+    
+    // Clean up any existing temp files from previous failed attempts
+    if (LittleFS.exists(monthlyTempPath)) LittleFS.remove(monthlyTempPath);
+    if (LittleFS.exists(monthlyGzTempPath)) LittleFS.remove(monthlyGzTempPath);
+    
+    // Collect matching daily files (excluding the specified date if provided)
+    std::vector<char*> dailyFiles;
+    File dir = LittleFS.open(ENERGY_CSV_DAILY_PREFIX);
+    if (!dir) {
+        LOG_ERROR("Failed to open daily folder");
+        return false;
+    }
+    
+    dir.rewindDirectory();
+    uint32_t loops = 0;
+    
+    File file = dir.openNextFile();
+    while (file && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        
+        if (!file.isDirectory()) {
+            const char* filename = file.name();
+            
+            // Check if file matches the month pattern (YYYY-MM-DD.csv.gz)
+            if (endsWith(filename, ".csv.gz") && strncmp(filename, yearMonth, 7) == 0) {
+                // Check if this date should be excluded (e.g., today's date)
+                if (excludeDate && strncmp(filename, excludeDate, 10) == 0) {
+                    LOG_DEBUG("Skipping excluded date: %s", filename);
+                    file.close();
+                    file = dir.openNextFile();
+                    continue;
+                }
+                
+                char* fileCopy = (char*)ps_malloc(strlen(filename) + 1);
+                if (fileCopy) {
+                    strcpy(fileCopy, filename);
+                    dailyFiles.push_back(fileCopy);
+                } else {
+                    LOG_WARNING("Failed to allocate %zu bytes from PSRAM for filename: %s (free PSRAM: %lu)", 
+                                strlen(filename) + 1, filename, ESP.getFreePsram());
+                }
+            }
+        }
+        
+        file.close();
+        file = dir.openNextFile();
+    }
+    dir.close();
+    
+    if (dailyFiles.empty()) {
+        LOG_DEBUG("No daily files found for %s", yearMonth);
+        return true;
+    }
+    
+    LOG_DEBUG("Found %d daily files for %s", dailyFiles.size(), yearMonth);
+    
+    // Sort files by name (chronological order)
+    std::sort(dailyFiles.begin(), dailyFiles.end(), [](const char* a, const char* b) {
+        return strcmp(a, b) < 0;
+    });
+    
+    // Create temporary consolidated CSV file
+    File tempFile = LittleFS.open(monthlyTempPath, FILE_WRITE);
+    if (!tempFile) {
+        LOG_ERROR("Failed to create temp file: %s", monthlyTempPath);
+        for (auto f : dailyFiles) free(f);
+        return false;
+    }
+    
+    bool success = true;
+    
+    // If existing archive exists, decompress it and copy content first (skip writing new header)
+    if (existingArchive) {
+        char existingCsvPath[NAME_BUFFER_SIZE];
+        snprintf(existingCsvPath, sizeof(existingCsvPath), "%s/_existing_monthly.csv", ENERGY_CSV_MONTHLY_PREFIX);
+        
+        // Clean up any existing temp file
+        if (LittleFS.exists(existingCsvPath)) LittleFS.remove(existingCsvPath);
+        
+        // Decompress existing archive
+        if (_decompressGzipFile(monthlyGzPath, existingCsvPath)) {
+            // Append existing content (including header since it's the first content)
+            if (!_appendFileToFile(existingCsvPath, tempFile, false)) {
+                LOG_ERROR("Failed to append existing monthly archive content");
+                success = false;
+            }
+            LittleFS.remove(existingCsvPath);
+        } else {
+            LOG_ERROR("Failed to decompress existing monthly archive");
+            success = false;
+        }
+        
+        if (!success) {
+            tempFile.close();
+            LittleFS.remove(monthlyTempPath);
+            for (auto f : dailyFiles) free(f);
+            return false;
+        }
+    } else {
+        // Write header once (only for new archives)
+        tempFile.println(DAILY_ENERGY_CSV_HEADER);
+    }
+    
+    std::vector<char*> processedFiles;
+    
+    for (size_t i = 0; i < dailyFiles.size() && success; i++) {
+        char gzPath[NAME_BUFFER_SIZE];
+        char csvPath[NAME_BUFFER_SIZE];
+        snprintf(gzPath, sizeof(gzPath), "%s/%s", ENERGY_CSV_DAILY_PREFIX, dailyFiles[i]);
+        
+        // Create temp path for decompressed CSV
+        char tempCsvName[NAME_BUFFER_SIZE];
+        snprintf(tempCsvName, sizeof(tempCsvName), "%s/%sdecomp.csv", ENERGY_CSV_DAILY_PREFIX, TEMPORARY_FILE_PREFIX);
+        snprintf(csvPath, sizeof(csvPath), "%s", tempCsvName);
+        
+        // Clean up any existing temp CSV
+        if (LittleFS.exists(csvPath)) LittleFS.remove(csvPath);
+        
+        // Decompress the daily file
+        if (!_decompressGzipFile(gzPath, csvPath)) {
+            LOG_ERROR("Failed to decompress %s", gzPath);
+            success = false;
+            break;
+        }
+        
+        // Append to consolidated file (skip header)
+        if (!_appendFileToFile(csvPath, tempFile, true)) {
+            LOG_ERROR("Failed to append %s to consolidated file", dailyFiles[i]);
+            LittleFS.remove(csvPath);
+            success = false;
+            break;
+        }
+        
+        // Remove temp decompressed file
+        LittleFS.remove(csvPath);
+        
+        processedFiles.push_back(dailyFiles[i]);
+        LOG_VERBOSE("Consolidated %s", dailyFiles[i]);
+    }
+    
+    tempFile.close();
+    
+    if (!success) {
+        LittleFS.remove(monthlyTempPath);
+        for (auto f : dailyFiles) free(f);
+        return false;
+    }
+    
+    // Verify temp file has content
+    File verifyFile = LittleFS.open(monthlyTempPath, FILE_READ);
+    if (!verifyFile || verifyFile.size() < ENERGY_CONSOLIDATION_MIN_SIZE) {
+        LOG_ERROR("Consolidated temp file too small or invalid");
+        if (verifyFile) verifyFile.close();
+        LittleFS.remove(monthlyTempPath);
+        for (auto f : dailyFiles) free(f);
+        return false;
+    }
+    verifyFile.close();
+    
+    // Rename temp to final CSV
+    if (!LittleFS.rename(monthlyTempPath, monthlyFinalPath)) {
+        LOG_ERROR("Failed to rename temp file to final CSV");
+        LittleFS.remove(monthlyTempPath);
+        for (auto f : dailyFiles) free(f);
+        return false;
+    }
+    
+    // Compress the consolidated CSV
+    if (!compressFile(monthlyFinalPath)) {
+        LOG_ERROR("Failed to compress consolidated file");
+        for (auto f : dailyFiles) free(f);
+        return false;
+    }
+    
+    // Verify compressed file exists and has content
+    File verifyGz = LittleFS.open(monthlyGzPath, FILE_READ);
+    if (!verifyGz || verifyGz.size() < ENERGY_CONSOLIDATION_MIN_SIZE) {
+        LOG_ERROR("Compressed file too small or invalid");
+        if (verifyGz) verifyGz.close();
+        for (auto f : dailyFiles) free(f);
+        return false;
+    }
+    size_t finalSize = verifyGz.size();
+    verifyGz.close();
+    
+    // Delete original daily files
+    uint32_t deletedCount = 0;
+    for (auto filename : processedFiles) {
+        char gzPath[NAME_BUFFER_SIZE];
+        snprintf(gzPath, sizeof(gzPath), "%s/%s", ENERGY_CSV_DAILY_PREFIX, filename);
+        if (LittleFS.remove(gzPath)) {
+            deletedCount++;
+        } else {
+            LOG_WARNING("Failed to delete %s after consolidation", gzPath);
+        }
+    }
+    
+    // Cleanup
+    for (auto f : dailyFiles) free(f);
+    
+    LOG_INFO("Consolidated %d daily files for %s into %zu bytes (%lu deleted)", 
+             processedFiles.size(), yearMonth, finalSize, deletedCount);
+    
+    return true;
+}
+
+bool consolidateMonthlyFilesToYearly(const char* year, const char* excludeMonth) {
+    if (!year || strlen(year) != 4) { // Format: YYYY
+        LOG_ERROR("Invalid year format: %s (expected YYYY)", year ? year : "null");
+        return false;
+    }
+    
+    LOG_DEBUG("Starting monthly -> yearly consolidation for %s (excluding: %s)", year, excludeMonth ? excludeMonth : "none");
+    
+    // Ensure yearly directory exists
+    if (!_ensureDirectoryExists(ENERGY_CSV_YEARLY_PREFIX)) return false;
+    
+    // Check if monthly folder exists
+    if (!LittleFS.exists(ENERGY_CSV_MONTHLY_PREFIX)) {
+        LOG_DEBUG("Monthly folder does not exist, nothing to consolidate");
+        return true;
+    }
+    
+    // Prepare paths
+    char yearlyTempPath[NAME_BUFFER_SIZE];
+    char yearlyFinalPath[NAME_BUFFER_SIZE];
+    char yearlyGzPath[NAME_BUFFER_SIZE];
+    snprintf(yearlyTempPath, sizeof(yearlyTempPath), "%s/%s.csv.tmp", ENERGY_CSV_YEARLY_PREFIX, year);
+    snprintf(yearlyFinalPath, sizeof(yearlyFinalPath), "%s/%s.csv", ENERGY_CSV_YEARLY_PREFIX, year);
+    snprintf(yearlyGzPath, sizeof(yearlyGzPath), "%s/%s.csv.gz", ENERGY_CSV_YEARLY_PREFIX, year);
+    
+    // Check if yearly archive already exists - we'll need to decompress and append
+    bool existingArchive = LittleFS.exists(yearlyGzPath);
+    if (existingArchive) {
+        LOG_DEBUG("Yearly archive already exists for %s, will append new monthly files", year);
+    }
+    
+    // Clean up any existing temp files
+    if (LittleFS.exists(yearlyTempPath)) LittleFS.remove(yearlyTempPath);
+    
+    // Collect matching monthly files (excluding the specified month if provided)
+    std::vector<char*> monthlyFiles;
+    File dir = LittleFS.open(ENERGY_CSV_MONTHLY_PREFIX);
+    if (!dir) {
+        LOG_ERROR("Failed to open monthly folder");
+        return false;
+    }
+    
+    dir.rewindDirectory();
+    uint32_t loops = 0;
+    
+    File file = dir.openNextFile();
+    while (file && loops < MAX_LOOP_ITERATIONS) {
+        loops++;
+        
+        if (!file.isDirectory()) {
+            const char* filename = file.name();
+            
+            // Check if file matches the year pattern (YYYY-MM.csv.gz)
+            if (endsWith(filename, ".csv.gz") && strncmp(filename, year, 4) == 0) {
+                // Check if this month should be excluded (e.g., current month)
+                if (excludeMonth && strncmp(filename, excludeMonth, 7) == 0) {
+                    LOG_DEBUG("Skipping excluded month: %s", filename);
+                    file.close();
+                    file = dir.openNextFile();
+                    continue;
+                }
+                
+                char* fileCopy = (char*)ps_malloc(strlen(filename) + 1);
+                if (fileCopy) {
+                    strcpy(fileCopy, filename);
+                    monthlyFiles.push_back(fileCopy);
+                } else {
+                    LOG_WARNING("Failed to allocate %zu bytes from PSRAM for filename: %s (free PSRAM: %lu)", 
+                                strlen(filename) + 1, filename, ESP.getFreePsram());
+                }
+            }
+        }
+        
+        file.close();
+        file = dir.openNextFile();
+    }
+    dir.close();
+    
+    if (monthlyFiles.empty()) {
+        LOG_DEBUG("No monthly files found for %s", year);
+        return true;
+    }
+    
+    LOG_DEBUG("Found %d monthly files for %s", monthlyFiles.size(), year);
+    
+    // Sort files by name (chronological order)
+    std::sort(monthlyFiles.begin(), monthlyFiles.end(), [](const char* a, const char* b) {
+        return strcmp(a, b) < 0;
+    });
+    
+    // If existing archive, decompress it first as a starting point
+    if (existingArchive) {
+        if (!_decompressGzipFile(yearlyGzPath, yearlyTempPath)) {
+            LOG_ERROR("Failed to decompress existing yearly archive %s", yearlyGzPath);
+            for (auto f : monthlyFiles) free(f);
+            return false;
+        }
+        LOG_DEBUG("Decompressed existing yearly archive for appending");
+    }
+    
+    // Create/append to temporary consolidated CSV file
+    File tempFile = LittleFS.open(yearlyTempPath, existingArchive ? FILE_APPEND : FILE_WRITE);
+    if (!tempFile) {
+        LOG_ERROR("Failed to open temp file: %s", yearlyTempPath);
+        for (auto f : monthlyFiles) free(f);
+        return false;
+    }
+    
+    // Write header only if new file
+    if (!existingArchive) {
+        tempFile.println(DAILY_ENERGY_CSV_HEADER);
+    }
+    
+    bool success = true;
+    std::vector<char*> processedFiles;
+    
+    for (size_t i = 0; i < monthlyFiles.size() && success; i++) {
+        char gzPath[NAME_BUFFER_SIZE];
+        char csvPath[NAME_BUFFER_SIZE];
+        snprintf(gzPath, sizeof(gzPath), "%s/%s", ENERGY_CSV_MONTHLY_PREFIX, monthlyFiles[i]);
+        
+        // Create temp path for decompressed CSV
+        char tempCsvName[NAME_BUFFER_SIZE];
+        snprintf(tempCsvName, sizeof(tempCsvName), "%s/%sdecomp.csv", ENERGY_CSV_MONTHLY_PREFIX, TEMPORARY_FILE_PREFIX);
+        snprintf(csvPath, sizeof(csvPath), "%s", tempCsvName);
+        
+        // Clean up any existing temp CSV
+        if (LittleFS.exists(csvPath)) LittleFS.remove(csvPath);
+        
+        // Decompress the monthly file
+        if (!_decompressGzipFile(gzPath, csvPath)) {
+            LOG_ERROR("Failed to decompress %s", gzPath);
+            success = false;
+            break;
+        }
+        
+        // Append to consolidated file (skip header)
+        if (!_appendFileToFile(csvPath, tempFile, true)) {
+            LOG_ERROR("Failed to append %s to consolidated file", monthlyFiles[i]);
+            LittleFS.remove(csvPath);
+            success = false;
+            break;
+        }
+        
+        // Remove temp decompressed file
+        LittleFS.remove(csvPath);
+        
+        processedFiles.push_back(monthlyFiles[i]);
+        LOG_VERBOSE("Consolidated %s", monthlyFiles[i]);
+    }
+    
+    tempFile.close();
+    
+    if (!success) {
+        LittleFS.remove(yearlyTempPath);
+        for (auto f : monthlyFiles) free(f);
+        return false;
+    }
+    
+    // Verify temp file has content
+    File verifyFile = LittleFS.open(yearlyTempPath, FILE_READ);
+    if (!verifyFile || verifyFile.size() < ENERGY_CONSOLIDATION_MIN_SIZE) {
+        LOG_ERROR("Consolidated temp file too small or invalid");
+        if (verifyFile) verifyFile.close();
+        LittleFS.remove(yearlyTempPath);
+        for (auto f : monthlyFiles) free(f);
+        return false;
+    }
+    verifyFile.close();
+    
+    // Rename temp to final CSV
+    if (!LittleFS.rename(yearlyTempPath, yearlyFinalPath)) {
+        LOG_ERROR("Failed to rename temp file to final CSV");
+        LittleFS.remove(yearlyTempPath);
+        for (auto f : monthlyFiles) free(f);
+        return false;
+    }
+    
+    // Compress the consolidated CSV
+    if (!compressFile(yearlyFinalPath)) {
+        LOG_ERROR("Failed to compress consolidated file");
+        for (auto f : monthlyFiles) free(f);
+        return false;
+    }
+    
+    // Verify compressed file exists and has content
+    File verifyGz = LittleFS.open(yearlyGzPath, FILE_READ);
+    if (!verifyGz || verifyGz.size() < ENERGY_CONSOLIDATION_MIN_SIZE) {
+        LOG_ERROR("Compressed file too small or invalid");
+        if (verifyGz) verifyGz.close();
+        for (auto f : monthlyFiles) free(f);
+        return false;
+    }
+    size_t finalSize = verifyGz.size();
+    verifyGz.close();
+    
+    // Delete original monthly files
+    uint32_t deletedCount = 0;
+    for (auto filename : processedFiles) {
+        char gzPath[NAME_BUFFER_SIZE];
+        snprintf(gzPath, sizeof(gzPath), "%s/%s", ENERGY_CSV_MONTHLY_PREFIX, filename);
+        if (LittleFS.remove(gzPath)) {
+            deletedCount++;
+        } else {
+            LOG_WARNING("Failed to delete %s after consolidation", gzPath);
+        }
+    }
+    
+    // Cleanup
+    for (auto f : monthlyFiles) free(f);
+    
+    LOG_INFO("Consolidated %d monthly files for %s into %zu bytes (%lu deleted)", 
+             processedFiles.size(), year, finalSize, deletedCount);
+    
+    return true;
+}
+
+bool nvsDataToJson(JsonObject &doc) {
+    LOG_DEBUG("Exporting NVS data to JSON document");
+
+    // Add metadata
+    doc["version"] = 1;
+    doc["type"] = "configuration";
+
+    char deviceId[DEVICE_ID_BUFFER_SIZE];
+    getDeviceId(deviceId, sizeof(deviceId));
+    doc["deviceId"] = deviceId;
+
+    doc["firmwareVersion"] = FIRMWARE_BUILD_VERSION;
+    doc["sketchMD5"] = ESP.getSketchMD5().c_str();
+
+    char timestamp[TIMESTAMP_ISO_BUFFER_SIZE];
+    CustomTime::getTimestampIso(timestamp, sizeof(timestamp));
+    doc["timestamp"] = timestamp;
+
+    // Create nvs object
+    doc["nvs"].to<JsonObject>();
+
+    // Namespaces to exclude from backup (sensitive, device-specific, or auto-generated data)
+    const char* excludedNamespaces[] = {EXCLUDED_NVS_NAMESPACES_LIST};
+    const size_t excludedCount = sizeof(excludedNamespaces) / sizeof(excludedNamespaces[0]);
+
+    // Iterate ALL NVS entries and populate
+    nvs_iterator_t it = nullptr;
+    esp_err_t err = nvs_entry_find("nvs", nullptr, NVS_TYPE_ANY, &it);
+
+    if (err != ESP_OK) {
+        LOG_ERROR("Could not initialize NVS iterator (error %d - %s)", err, esp_err_to_name(err));
+        return false;
+    }
+
+    uint32_t entryCount = 0;
+    while (err == ESP_OK && entryCount < MAX_LOOP_ITERATIONS) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        entryCount++;
+
+        // Reset task watchdog periodically to prevent timeout during long NVS iteration
+        // This is safe because we're making progress, not stuck
+        if (entryCount % 10 == 0) {
+            esp_task_wdt_reset();
+        }
+
+        // Skip excluded namespaces
+        bool isExcluded = false;
+        for (size_t i = 0; i < excludedCount; i++) {
+            if (strcmp(info.namespace_name, excludedNamespaces[i]) == 0) {
+                isExcluded = true;
+                break;
+            }
+        }
+        if (isExcluded) {
+            err = nvs_entry_next(&it);
+            continue;
+        }
+
+        // Auto-create namespace object if first time seeing it
+        if (!doc["nvs"][info.namespace_name].is<JsonObject>()) {
+            doc["nvs"][info.namespace_name].to<JsonObject>();
+        }
+
+        // Read and store value based on type
+        Preferences prefs;
+        if (prefs.begin(info.namespace_name, true)) { // read-only
+            switch(info.type) {
+                case NVS_TYPE_U8:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "u8";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getUChar(info.key, 0);
+                    break;
+                case NVS_TYPE_I8:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "i8";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getChar(info.key, 0);
+                    break;
+                case NVS_TYPE_U16:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "u16";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getUShort(info.key, 0);
+                    break;
+                case NVS_TYPE_I16:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "i16";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getShort(info.key, 0);
+                    break;
+                case NVS_TYPE_U32:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "u32";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getUInt(info.key, 0);
+                    break;
+                case NVS_TYPE_I32:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "i32";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getInt(info.key, 0);
+                    break;
+                case NVS_TYPE_U64:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "u64";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getULong64(info.key, 0);
+                    break;
+                case NVS_TYPE_I64:
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "i64";
+                    doc["nvs"][info.namespace_name][info.key]["value"] = prefs.getLong64(info.key, 0);
+                    break;
+                case NVS_TYPE_STR: {
+                    char strBuffer[NVS_STRING_MAX_SIZE];
+                    size_t strLen = prefs.getString(info.key, strBuffer, sizeof(strBuffer));
+                    if (strLen > 0) {
+                        doc["nvs"][info.namespace_name][info.key]["value"] = strBuffer;
+                    } else {
+                        doc["nvs"][info.namespace_name][info.key]["value"] = "";
+                    }
+                    doc["nvs"][info.namespace_name][info.key]["type"] = "str";
+                    break;
+                }
+                case NVS_TYPE_BLOB: {
+                    // Get blob size
+                    size_t blobSize = prefs.getBytesLength(info.key);
+                    if (blobSize > 0) {
+                        // Allocate buffer for blob data
+                        uint8_t* blobData = (uint8_t*)ps_malloc(blobSize);
+                        if (blobData != nullptr) {
+                            size_t readSize = prefs.getBytes(info.key, blobData, blobSize);
+
+                            if (readSize > 0) {
+                                // Try to interpret common blob sizes as numeric types
+                                if (readSize == sizeof(float)) {
+                                    // Interpret as float
+                                    float value;
+                                    memcpy(&value, blobData, sizeof(float));
+                                    doc["nvs"][info.namespace_name][info.key]["value"] = value;
+                                    doc["nvs"][info.namespace_name][info.key]["type"] = "float";
+                                } else if (readSize == sizeof(double)) {
+                                    // Interpret as double
+                                    double value;
+                                    memcpy(&value, blobData, sizeof(double));
+                                    doc["nvs"][info.namespace_name][info.key]["value"] = value;
+                                    doc["nvs"][info.namespace_name][info.key]["type"] = "double";
+                                } else {
+                                    // Not supported since it makes the JSON too large
+                                    LOG_WARNING("Skipping blob key %s in namespace %s due to unsupported size %zu bytes", 
+                                                info.key, info.namespace_name, readSize);
+                                }
+                            }
+                            free(blobData);
+                        }
+                    }
+                    break;
+                }
+                default:
+                    LOG_WARNING("Unknown NVS type %d for key %s in namespace %s", info.type, info.key, info.namespace_name);
+                    break;
+            }
+            prefs.end();
+        }
+
+        err = nvs_entry_next(&it);
+
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+            LOG_ERROR("Could not advance NVS iterator (error %d - %s)", err, esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    if (it != nullptr) {
+        nvs_release_iterator(it);
+    }
+
+    LOG_DEBUG("Completed exporting %u NVS entries to JSON. Size of JSON: %zu bytes", entryCount, measureJson(doc));
+    return true;
+}
+
+// Background task that creates TAR data for streaming backup
+static void tarPackerTask(void* param) {
+    RingBufferStream* stream = (RingBufferStream*)param;
+
+    LOG_DEBUG("TAR packing task started");
+
+    // Collect all files and directories from root
+    std::vector<TAR::dir_entity_t> dirEntities;
+    TarPacker::collectDirEntities(&dirEntities, &LittleFS, "/");
+
+    if (dirEntities.empty()) {
+        LOG_ERROR("No files found in LittleFS for backup");
+        stream->setError();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    LOG_DEBUG("Collected %d entities for TAR packing", dirEntities.size());
+
+    // Set progress callback to feed watchdog during packing
+    TarPacker::setProgressCallBack([](size_t packedBytes, size_t totalBytes) {
+        const size_t progressInterval = 1024 * 32;  // Reset watchdog every 32KB
+        if (packedBytes % progressInterval == 0 || packedBytes == totalBytes) {
+            esp_task_wdt_reset();
+            LOG_DEBUG("TAR packing progress: %zu / %zu bytes (%.2f%%)",
+                     packedBytes, totalBytes, (double)packedBytes / totalBytes * 100);
+        }
+    });
+
+    LOG_DEBUG("Starting TAR packing to stream");
+    size_t packed = TarPacker::pack_files(&LittleFS, dirEntities, stream);
+
+    // Clear progress callback
+    TarPacker::setProgressCallBack(nullptr);
+
+    if (packed > 0) {
+        LOG_INFO("TAR packing complete: %zu bytes", packed);
+        stream->setEOF(); // Signal consumer we're done
+    } else {
+        LOG_ERROR("TAR packing failed (error code: %zu)", packed);
+        stream->setError();
+    }
+
+    LOG_DEBUG("Tar packer task exiting");
+    vTaskDelete(NULL); // Delete self
+}
+
+// Start streaming backup (returns stream that caller must delete when done)
+RingBufferStream* startStreamingBackup() {
+    LOG_DEBUG("Starting streaming backup");
+
+    RingBufferStream* stream = new RingBufferStream();
+    if (!stream) {
+        LOG_ERROR("Failed to start streaming backup");
+        return nullptr;
+    }
+
+    BaseType_t result = xTaskCreate(
+        tarPackerTask,
+        TASK_TAR_PACKER_NAME,
+        TASK_TAR_PACKER_STACK_SIZE,
+        stream,
+        TASK_TAR_PACKER_PRIORITY,
+        nullptr
+    );
+
+    if (result != pdPASS) {
+        LOG_ERROR("Failed to create tar packer task");
+        delete stream;
+        return nullptr;
+    }
+
+    LOG_DEBUG("Streaming backup started successfully");
+    return stream;
+}
+
+// ========== RESTORE UTILITIES ==========
+
+// Check if configuration restore is pending (set by restore endpoint before restart)
+bool isNvsRestorePending() {
+    Preferences prefs;
+    if (!prefs.begin(PREFERENCES_NAMESPACE_GENERAL, true)) {
+        return false;
+    }
+    bool pending = prefs.getBool("restore_pending", false);
+    prefs.end();
+    return pending;
+}
+
+// Restore NVS from JSON document (inverse of nvsDataToJson)
+bool restoreNvsFromJson(JsonDocument &doc) {
+    LOG_INFO("Starting NVS configuration restore");
+
+    uint32_t totalKeys = 0;
+    uint32_t successKeys = 0;
+    uint32_t failedKeys = 0;
+
+    // Iterate namespaces
+    for (JsonPair nsPair : doc["nvs"].as<JsonObject>()) {
+        const char* ns = nsPair.key().c_str();
+
+        // Skip excluded namespaces (should not be present in restore file, but safety check)
+        const char* excludedNamespaces[] = {EXCLUDED_NVS_NAMESPACES_LIST};
+        bool isExcluded = false;
+        for (const char* excluded : excludedNamespaces) {
+            if (strcmp(ns, excluded) == 0) {
+                LOG_WARNING("Skipping excluded namespace in restore: %s (security/device-specific data)", ns);
+                isExcluded = true;
+                break;
+            }
+        }
+        if (isExcluded) continue;
+
+        LOG_DEBUG("Restoring namespace: %s", ns);
+
+        Preferences prefs;
+        if (!prefs.begin(ns, false)) {
+            LOG_WARNING("Failed to open namespace: %s", ns);
+            continue;
+        }
+
+        // Iterate keys in namespace
+        for (JsonPair keyPair : nsPair.value().as<JsonObject>()) {
+            const char* key = keyPair.key().c_str();
+            JsonVariant keyData = keyPair.value();
+            totalKeys++;
+
+            bool success = false;
+
+            // Read type and value from new format: {"type": "u8", "value": 123}
+            if (!keyData.is<JsonObject>() || !keyData["type"].is<const char*>() || !keyData.containsKey("value")) {
+                LOG_WARNING("Invalid key format: %s/%s (missing type or value)", ns, key);
+                failedKeys++;
+                continue;
+            }
+
+            const char* typeStr = keyData["type"].as<const char*>();
+            JsonVariant valueVar = keyData["value"];
+
+            // Write based on explicit type metadata (no guessing needed!)
+            if (strcmp(typeStr, "u8") == 0) {
+                success = prefs.putUChar(key, (uint8_t)valueVar.as<int>());
+            } else if (strcmp(typeStr, "i8") == 0) {
+                success = prefs.putChar(key, (int8_t)valueVar.as<int>());
+            } else if (strcmp(typeStr, "u16") == 0) {
+                success = prefs.putUShort(key, (uint16_t)valueVar.as<int>());
+            } else if (strcmp(typeStr, "i16") == 0) {
+                success = prefs.putShort(key, (int16_t)valueVar.as<int>());
+            } else if (strcmp(typeStr, "u32") == 0) {
+                success = prefs.putUInt(key, (uint32_t)valueVar.as<unsigned long>());
+            } else if (strcmp(typeStr, "i32") == 0) {
+                success = prefs.putInt(key, (int32_t)valueVar.as<long>());
+            } else if (strcmp(typeStr, "u64") == 0) {
+                success = prefs.putULong64(key, (uint64_t)valueVar.as<unsigned long long>());
+            } else if (strcmp(typeStr, "i64") == 0) {
+                success = prefs.putLong64(key, (int64_t)valueVar.as<long long>());
+            } else if (strcmp(typeStr, "float") == 0) {
+                success = prefs.putFloat(key, valueVar.as<float>());
+            } else if (strcmp(typeStr, "str") == 0) {
+                size_t len = prefs.putString(key, valueVar.as<const char*>()); // This returns the length of the string stored, not true/false
+                success = strlen(valueVar.as<const char*>()) == len;
+            } else if (strcmp(typeStr, "blob") == 0) {
+                LOG_WARNING("BLOB type not yet supported during restore: %s/%s", ns, key);
+                failedKeys++;
+                continue;
+            } else {
+                LOG_WARNING("Unknown NVS type '%s' for key %s/%s", typeStr, ns, key);
+                failedKeys++;
+                continue;
+            }
+
+            if (success) {
+                successKeys++;
+            } else {
+                failedKeys++;
+                LOG_WARNING("Failed to restore key: %s/%s (type: %s)", ns, key, typeStr);
+            }
+        }
+
+        prefs.end();
+    }
+
+    LOG_INFO("NVS restore complete: %lu/%lu keys succeeded, %lu failed",
+             successKeys, totalKeys, failedKeys);
+
+    return totalKeys > 0 && successKeys > 0;
+}
+
+// Perform configuration restore from staged file (called during early boot, before services start)
+void performNvsRestore() {
+    LOG_INFO("Configuration restore pending flag detected");
+
+    // Clear flag immediately to prevent retry loops on failure
+    Preferences prefs;
+    if (prefs.begin(PREFERENCES_NAMESPACE_GENERAL, false)) {
+        prefs.putBool("restore_pending", false);
+        prefs.end();
+    }
+
+    // Check if restore file exists
+    if (!LittleFS.exists("/restore/nvs_restore.json")) {
+        LOG_ERROR("Restore file not found, skipping restore");
+        return;
+    }
+
+    // LED indicator: orange = restoring
+    Led::setOrange(Led::PRIO_CRITICAL);
+
+    // Read and parse restore file
+    File restoreFile = LittleFS.open("/restore/nvs_restore.json", FILE_READ);
+    if (!restoreFile) {
+        LOG_ERROR("Failed to open restore file");
+        LittleFS.remove("/restore/nvs_restore.json");
+        return;
+    }
+
+    SpiRamAllocator allocator;
+    JsonDocument doc(&allocator);
+    DeserializationError error = deserializeJson(doc, restoreFile);
+    restoreFile.close();
+
+    if (error) {
+        LOG_ERROR("Failed to parse restore JSON: %s", error.c_str());
+        LittleFS.remove("/restore/nvs_restore.json");
+        return;
+    }
+
+    // Perform restore
+    bool success = restoreNvsFromJson(doc);
+
+    // Clean up restore file
+    LittleFS.remove("/restore/nvs_restore.json");
+
+    if (success) {
+        LOG_INFO("Configuration restored successfully");
+        Led::setGreen(Led::PRIO_NORMAL);
+    } else {
+        LOG_ERROR("Configuration restore failed or incomplete");
+        Led::setRed(Led::PRIO_URGENT);
+    }
+
+    delay(2000); // Brief visual feedback
+}
+
+// Check if backup version is compatible with current firmware
+// Compatibility rule: backup can be restored if:
+// - Backup major version == current major version
+// - Backup version <= current version
+// This allows forward compatibility (1.0.0 backup on 1.5.0 firmware) but not backward (1.5.0 backup on 1.0.0)
+bool isBackupVersionCompatible(const char* backupVersion) {
+    if (!backupVersion) {
+        LOG_WARNING("Backup version is null, cannot check compatibility");
+        return false;
+    }
+
+    // Parse backup version (format: "X.Y.Z" or "X.Y.Z (dev)")
+    int backupMajor = 0, backupMinor = 0, backupPatch = 0;
+    if (sscanf(backupVersion, "%d.%d.%d", &backupMajor, &backupMinor, &backupPatch) < 3) {
+        LOG_WARNING("Invalid backup version format: %s", backupVersion);
+        return false;
+    }
+
+    // Get current firmware version from build info (defined in constants.h)
+    // The version string format: "X.Y.Z"
+    const char* currentVersionStr = FIRMWARE_BUILD_VERSION;
+    int currentMajor = 0, currentMinor = 0, currentPatch = 0;
+    if (sscanf(currentVersionStr, "%d.%d.%d", &currentMajor, &currentMinor, &currentPatch) < 3) {
+        LOG_WARNING("Invalid current firmware version format: %s", currentVersionStr);
+        return false;
+    }
+
+    LOG_DEBUG("Version check - Backup: %d.%d.%d, Current: %d.%d.%d",
+             backupMajor, backupMinor, backupPatch, currentMajor, currentMinor, currentPatch);
+
+    // Check major version match
+    if (backupMajor != currentMajor) {
+        LOG_WARNING("Version incompatible: backup major version %d != current major version %d",
+                   backupMajor, currentMajor);
+        return false;
+    }
+
+    // Check if backup version <= current version
+    if (backupMajor < currentMajor) return true;  // Should not reach here due to earlier check
+
+    if (backupMinor > currentMinor) {
+        LOG_WARNING("Version incompatible: backup minor version %d > current minor version %d",
+                   backupMinor, currentMinor);
+        return false;
+    }
+
+    if (backupMinor == currentMinor && backupPatch > currentPatch) {
+        LOG_WARNING("Version incompatible: backup patch version %d > current patch version %d",
+                   backupPatch, currentPatch);
+        return false;
+    }
+
+    LOG_DEBUG("Backup version compatible: %d.%d.%d <= %d.%d.%d (same major)",
+            backupMajor, backupMinor, backupPatch, currentMajor, currentMinor, currentPatch);
+    return true;
+}

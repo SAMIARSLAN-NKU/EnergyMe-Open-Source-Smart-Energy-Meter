@@ -1,0 +1,658 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Copyright (C) 2025 Jibril Sharafi -->
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <link rel="stylesheet" type="text/css" href="/css/button.css">
+    <link rel="stylesheet" type="text/css" href="/css/styles.css">
+    <link rel="stylesheet" type="text/css" href="/css/section.css">
+    <link rel="stylesheet" type="text/css" href="/css/typography.css">
+    <link rel="stylesheet" type="text/css" href="/css/forms.css">
+    <link rel="stylesheet" type="text/css" href="/css/tooltip.css">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+
+    <title>Channel</title>
+    <style>
+        .channel-columns {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 10px;
+            justify-items: center;
+        }
+
+        .channel-columns .section-box {
+            width: 80%;
+        }
+
+        .channel-columns input[type="text"] {
+            width: 90%;
+            box-sizing: border-box;
+        }
+
+        .phase-preview {
+            font-size: 0.85em;
+            color: #666;
+            margin-top: 6px;
+            min-height: 1em;
+        }
+
+        .phase-preview strong {
+            color: #2e7d32;
+        }
+
+        /* Page-specific mobile styles */
+        @media screen and (max-width: 768px) {
+            .channel-columns {
+                grid-template-columns: 1fr;
+                gap: 15px;
+                padding: 0 10px;
+            }
+            
+            .channel-columns input[type="text"] {
+                width: 100%;
+            }
+            
+            .channel-item {
+                width: 100%;
+                padding: 15px;
+                margin-bottom: 10px;
+                border: 1px solid #eee;
+                border-radius: 8px;
+                background-color: #f9f9f9;
+            }
+            
+            .channel-item h3 {
+                font-size: 1.2rem;
+                margin-bottom: 10px;
+            }
+            
+            .power-display {
+                font-size: 16px;
+                font-weight: bold;
+                color: #333;
+                margin: 8px 0;
+            }
+
+            #updateStatus {
+                font-size: 14px;
+                margin: 10px 0;
+            }
+        }
+        
+        @media screen and (max-width: 480px) {
+            .channel-columns {
+                padding: 0 5px;
+                gap: 12px;
+            }
+            
+            .channel-item {
+                padding: 12px;
+            }
+            
+            .channel-item h3 {
+                font-size: 1.1rem;
+            }
+            
+            .channel-columns input[type="text"] {
+                font-size: 14px;
+                padding: 10px;
+            }
+            
+            .channel-item label {
+                font-size: 13px;
+            }
+            
+            .power-display {
+                font-size: 14px;
+            }
+            
+            #updateStatus {
+                font-size: 13px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="buttonNavigation-container">
+        <a class="buttonNavigation" type="outer" href="/configuration">⚙️ Configuration</a>
+    </div>    <div id="channelContainer" class="section-box" style="text-align: center;">
+        <h1>Channels</h1>
+        <div class="channel-columns"></div>
+    </div>
+</body>
+
+<script src="/js/api-client.js"></script>
+<script src="/js/issues.js"></script>
+<script src="/js/tooltip.js"></script>
+<script>
+    var channelData = {};
+    var powerUpdateInterval = null;
+    const FETCH_THROTTLE = 2000; // Increased for better stability
+    var updateQueue = {};
+    var isProcessingUpdate = false;
+
+    // Firmware can mutate channel state asynchronously after a PATCH (e.g. the
+    // auto-polarity check flips `reverse` on the next meter reading, channel 0
+    // is force-reactivated). Re-fetch shortly after each PATCH so the UI reflects
+    // what the firmware actually settled on. 2.5s covers a full WDRR rotation
+    // plus one polarity-check pass under realistic channel counts.
+    const RECONCILE_DELAY_MS = 2500;
+    var reconcileTimers = {};
+
+    // Initialize the page
+    async function initializePage() {
+        try {
+            // Load channel config only
+            const channelResponse = await energyApi.getChannelConfig();
+            channelData = channelResponse;
+
+            createChannelBoxes();
+        } catch (error) {
+            console.error('Error initializing page:', error);
+            showStatus('Error loading data: ' + error.message, 'error');
+        }
+    }
+
+    // Initialize when page loads
+    document.addEventListener('DOMContentLoaded', initializePage);
+
+    function createChannelBoxes() {
+        const container = document.querySelector('.channel-columns');
+        container.innerHTML = ''; // Clear existing content
+
+        if (!channelData || Object.keys(channelData).length === 0) {
+            container.innerHTML = '<p>No channel data available</p>';
+            return;
+        }
+
+        Object.entries(channelData).forEach(([index, channel]) => {
+            const box = document.createElement('div');
+            box.className = 'section-box';
+            box.style.textAlign = 'center';
+
+            const phaseOptions = [
+                { value: 1, label: '1' },
+                { value: 2, label: '2' },
+                { value: 3, label: '3' },
+                { value: 4, label: '240V (Split Phase)' }
+            ]
+                .map(p => `<option value="${p.value}" ${p.value === channel.phase ? 'selected' : ''}>${p.label}</option>`)
+                .join('');
+
+            // Check if this is channel 0 (main voltage channel)
+            const isChannel0 = index == 0;
+            const activeCheckboxDisabled = isChannel0 ? 'disabled' : '';
+            const activeChecked = isChannel0 ? 'checked' : (channel.active ? 'checked' : '');
+
+            box.innerHTML = `
+                <h3>Channel ${index}<span id="issueChip${index}"></span></h3>
+                <label>
+                    Label:
+                    <input type="text" value="${channel.label || ''}" id="label${index}" onchange="queueChannelUpdate(${index})">
+                </label>
+                <div style="height: 10px;"></div>
+                <label>
+                    Phase
+                    <span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Phase">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            The AC phase this CT is measuring.<br><br>
+                            <strong>Single-phase</strong>: leave everything on Phase 1.<br><br>
+                            <strong>3-phase</strong>: assign each CT to its physical phase. While the load is drawing power, the live preview below shows what each choice would read &ndash; the right one has PF close to 1 (the power sign is irrelevant, it just flips with the CT orientation). Channel 0 carries the voltage reference, so its phase is correct by definition.<br><br>
+                            <strong>240V (Split Phase)</strong>: North American 240V circuits spanning both legs. A ×2 voltage multiplier is applied automatically, since the reference voltage is measured line-to-neutral (about 120&nbsp;V).
+                        </div>
+                    </span>
+                    <select id="phase${index}" onchange="queueChannelUpdate(${index})">
+                        ${phaseOptions}
+                    </select>
+                </label>
+                <div id="phasePreview${index}" class="phase-preview"></div>
+                <div style="height: 10px;"></div>
+                <label>
+                    <input type="checkbox" ${channel.reverse ? 'checked' : ''} id="reverse${index}" onchange="queueChannelUpdate(${index})">
+                    Reverse
+                    <span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Reverse">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Flips the sign of all readings from this channel. You should rarely need it: when current first flows, the firmware detects a reversed CT and sets this flag by itself.<br><br>
+                            Note that loads never display negative power (negative readings are clamped to 0&nbsp;W), so a reversed CT reads 0&nbsp;W until the auto-detection corrects it &ndash; usually within seconds of real load. Changing it manually disables auto-detection for this channel.
+                        </div>
+                    </span>
+                </label>
+                <div style="height: 10px;"></div>
+                <label>
+                    <input type="checkbox" ${activeChecked} id="active${index}" onchange="queueChannelUpdate(${index})" ${activeCheckboxDisabled}>
+                    Active
+                </label>
+                <div style="height: 15px;"></div>
+                <hr style="margin: 10px 0; border: none; border-top: 1px solid #ddd;">
+                <h4 style="margin: 10px 0;">Grouping
+                    <span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Grouping">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Channels sharing the same group label are combined into one card on the home dashboard. Use this for multi-phase loads (e.g. set all three phase CTs of your oven to "Oven" and the dashboard will show total power for the whole appliance).
+                        </div>
+                    </span>
+                </h4>
+                <label>
+                    <input type="text" value="${channel.groupLabel || ''}" id="groupLabel${index}" onchange="queueChannelUpdate(${index})" placeholder="Group label (optional)">
+                </label>
+                <div style="height: 15px;"></div>
+                <hr style="margin: 10px 0; border: none; border-top: 1px solid #ddd;">
+                <h4 style="margin: 10px 0;">Role
+                    <span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Channel Role">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Controls how this channel appears on the home dashboard and how its energy is counted:<br>
+                            <strong>Load</strong>: regular consumption. Only positive values are stored (negative discarded).<br>
+                            <strong>Grid</strong>: utility connection. Positive = importing (buying), negative = exporting (selling).<br>
+                            <strong>PV / Solar</strong>: generation. Only positive values are stored.<br>
+                            <strong>Battery</strong>: storage. Positive = discharging, negative = charging.<br>
+                            <strong>Inverter</strong>: DC-coupled hybrid (PV + Battery share one inverter). Both signs are kept.
+                        </div>
+                    </span>
+                </h4>
+                <label>
+                    <select id="role${index}" onchange="queueChannelUpdate(${index})">
+                        <option value="load" ${channel.role === 'load' ? 'selected' : ''}>Load</option>
+                        <option value="grid" ${channel.role === 'grid' ? 'selected' : ''}>Grid (+ import, - export)</option>
+                        <option value="pv" ${channel.role === 'pv' ? 'selected' : ''}>PV / Solar (+ generation)</option>
+                        <option value="battery" ${channel.role === 'battery' ? 'selected' : ''}>Battery (+ discharge, - charge)</option>
+                        <option value="inverter" ${channel.role === 'inverter' ? 'selected' : ''}>Inverter (PV + Battery DC-coupled)</option>
+                    </select>
+                </label>
+                <div style="height: 10px;"></div>
+                <span id="power${index}" style="font-weight: bold; color: #333;"></span>
+                <div style="height: 15px;"></div>
+                <hr style="margin: 10px 0; border: none; border-top: 1px solid #ddd;">
+                <button class="buttonForm" onclick="resetChannelEnergy(${index})"
+                    style="background-color: #dc3545; border-color: #dc3545; color: white; font-size: 0.85em; padding: 6px 12px;"
+                    onmouseover="this.style.backgroundColor='#c82333'" onmouseout="this.style.backgroundColor='#dc3545'">
+                    🗑️ Reset Energy
+                </button>
+            `;
+            container.appendChild(box);
+
+            if (channel.active) {
+                startPowerUpdate(index);
+            }
+        });
+
+        // Start global power updates if we have any active channels
+        startGlobalPowerUpdates();
+    }
+
+    // Live "what would each phase read" preview for 3-phase installs.
+    //
+    // The single voltage reference (L1) means a channel's phase assignment is pure
+    // math on the measured angle between voltage and current: the firmware rotates
+    // it by 0/+120/-120 degrees (phase 1/2/3, see _calculatePhaseShift in
+    // src/ade7953.cpp). So from one published reading (P, Q, S) we can reconstruct
+    // that angle and show what |active power| and PF every phase choice would yield -
+    // the installer picks the one that looks like a real load (PF near 1) instead of
+    // guessing from the breaker panel. The power sign is omitted: it is always
+    // flippable via the reverse flag, so it says nothing about the right phase.
+    const PHASE_ANGLES_DEG = { 1: 0, 2: -120, 3: 120 }; // IEC: PHASE_1=L1(0°), PHASE_2=L2(-120°), PHASE_3=L3(+120°)
+
+    function isThreePhaseInstall() {
+        const basePhase = channelData[0] ? channelData[0].phase : 1;
+        return Object.values(channelData).some(ch => ch && ch.active &&
+            (ch.phase in PHASE_ANGLES_DEG) && ch.phase !== basePhase);
+    }
+
+    function computePhaseCandidates(channel, basePhase, data) {
+        const p = data.activePower, q = data.reactivePower, s = data.apparentPower;
+        if (!(s > 0)) return { state: 'noload' };
+        // Negative reading clamped to zero this cycle (load/PV): angle not recoverable
+        if (p === 0) return { state: 'clamped' };
+
+        // The two firmware measurement branches publish reactivePower with different
+        // sign conventions: the energy-register branch (configured phase == base
+        // phase) gives the chip's signed Q, while the angle branch applies sign(PF),
+        // which mirrors Q whenever active power is negative. Undo that so atan2
+        // always sees the angle in the same frame as the published active power.
+        const revSign = channel.reverse ? -1 : 1;
+        const qEff = (channel.phase === basePhase) ? q : q * Math.sign(p) * revSign;
+        const psi = Math.atan2(qEff, p);
+
+        const candidates = {};
+        [1, 2, 3].forEach(c => {
+            const deltaRad = (PHASE_ANGLES_DEG[c] - PHASE_ANGLES_DEG[channel.phase]) * Math.PI / 180;
+            const cosC = Math.cos(psi + deltaRad);
+            candidates[c] = { power: s * cosC, pf: Math.abs(cosC) };
+        });
+        return { state: 'ok', candidates };
+    }
+
+    function updatePhasePreview(index, data) {
+        const el = document.getElementById(`phasePreview${index}`);
+        if (!el) return;
+
+        const channel = channelData[index];
+        const basePhase = channelData[0] ? channelData[0].phase : 1;
+        if (!channel || !channel.active || !isThreePhaseInstall() ||
+            !(channel.phase in PHASE_ANGLES_DEG) || !(basePhase in PHASE_ANGLES_DEG)) {
+            el.innerHTML = '';
+            return;
+        }
+
+        // Channel 0 carries the voltage reference: its phase defines the frame the
+        // other channels are measured in, so candidates for it are meaningless.
+        if (index == 0) {
+            el.innerHTML = 'Voltage reference &ndash; defines the phases of all other channels';
+            return;
+        }
+
+        const res = computePhaseCandidates(channel, basePhase, data);
+        if (res.state === 'noload') {
+            el.innerHTML = 'No load &ndash; phase preview unavailable';
+            return;
+        }
+        if (res.state === 'clamped') return; // transient, keep last preview
+
+        const bestPhase = [1, 2, 3].reduce((best, c) =>
+            res.candidates[c].pf > res.candidates[best].pf ? c : best, 1);
+        el.innerHTML = [1, 2, 3].map(c => {
+            const cand = res.candidates[c];
+            // Show |power|: the sign is always flippable via the reverse flag, so it
+            // carries no information about which phase is correct - PF magnitude does.
+            const text = `L${c}: ${Math.abs(cand.power).toFixed(1)} W (PF ${cand.pf.toFixed(2)})`;
+            return c === bestPhase ? `<strong>${text}</strong>` : text;
+        }).join('<br>');
+    }
+
+    function startGlobalPowerUpdates() {
+        // Stop any existing interval
+        if (powerUpdateInterval) {
+            clearInterval(powerUpdateInterval);
+        }
+
+        const updateAllPowerValues = async () => {
+            try {
+                const meterValuesArray = await energyApi.getMeterValues();
+                
+                // Update only active channels
+                meterValuesArray.forEach(channelMeterData => {
+                    const index = channelMeterData.index;
+                    const powerElement = document.getElementById(`power${index}`);
+                    
+                    // Only show power if channel is active
+                    if (powerElement && channelData[index] && channelData[index].active &&
+                        channelMeterData.data && channelMeterData.data.activePower !== undefined) {
+                        // Current and absolute PF only on a genuine reading: zeroed readings
+                        // (no-load / noise / clamp) have PF 0 by design, which carries no
+                        // information. PF sign carries inductive/capacitive in this firmware,
+                        // not flow direction (that is the sign of active power).
+                        const d = channelMeterData.data;
+                        const extraText = d.apparentPower > 0
+                            ? ` &middot; ${d.current.toFixed(3)} A &middot; PF ${Math.abs(d.powerFactor).toFixed(2)}`
+                            : '';
+                        powerElement.innerHTML = `${d.activePower.toFixed(1)} W${extraText}`;
+                        updatePhasePreview(index, channelMeterData.data);
+                    } else if (powerElement && channelData[index] && !channelData[index].active) {
+                        // Clear power display for inactive channels
+                        powerElement.innerHTML = '';
+                    }
+                });
+                
+            } catch (error) {
+                console.error('Error fetching power values:', error);
+                // Show error only on active channels
+                Object.keys(channelData).forEach(index => {
+                    if (channelData[index].active) {
+                        const powerElement = document.getElementById(`power${index}`);
+                        if (powerElement) {
+                            powerElement.innerHTML = 'Error';
+                        }
+                    }
+                });
+            }
+        };
+
+        // Initial update
+        updateAllPowerValues();
+        
+        // Set up interval for regular updates
+        powerUpdateInterval = setInterval(updateAllPowerValues, FETCH_THROTTLE);
+    }
+
+    function stopGlobalPowerUpdates() {
+        if (powerUpdateInterval) {
+            clearInterval(powerUpdateInterval);
+            powerUpdateInterval = null;
+        }
+    }
+
+    function startPowerUpdate(index) {
+        // Individual channel power updates are handled by the global update
+        const powerElement = document.getElementById(`power${index}`);
+        if (powerElement) {
+            powerElement.innerHTML = 'Loading...';
+        }
+    }
+
+    function stopPowerUpdate(index) {
+        // Clear individual channel power display
+        const powerElement = document.getElementById(`power${index}`);
+        if (powerElement) {
+            powerElement.innerHTML = '';
+        }
+        const previewElement = document.getElementById(`phasePreview${index}`);
+        if (previewElement) {
+            previewElement.innerHTML = '';
+        }
+    }
+
+    function queueChannelUpdate(index) {
+        // Prevent channel 0 from being disabled
+        if (index == 0) {
+            const activeCheckbox = document.getElementById(`active${index}`);
+            if (activeCheckbox && !activeCheckbox.checked) {
+                activeCheckbox.checked = true;
+                showStatus('Channel 0 is the main voltage channel and cannot be disabled', 'error');
+                return;
+            }
+        }
+
+        // Detect role change BEFORE updating local data
+        const oldData = channelData[index];
+        const newRole = document.getElementById(`role${index}`).value;
+
+        const roleChanged = oldData && (oldData.role !== newRole);
+
+        if (roleChanged) {
+            if (!confirm('Changing the channel role will reset its energy values and delete its historical data. This cannot be undone.\n\nDo you want to continue?')) {
+                // Revert dropdown to original value
+                document.getElementById(`role${index}`).value = oldData.role;
+                return;
+            }
+        }
+
+        doQueueChannelUpdate(index);
+    }
+
+    function doQueueChannelUpdate(index) {
+        const channelUpdate = {
+            index: parseInt(index),
+            label: document.getElementById(`label${index}`).value,
+            reverse: document.getElementById(`reverse${index}`).checked,
+            phase: parseInt(document.getElementById(`phase${index}`).value),
+            active: document.getElementById(`active${index}`).checked,
+            // Grouping
+            groupLabel: document.getElementById(`groupLabel${index}`).value,
+            // Channel role
+            role: document.getElementById(`role${index}`).value,
+        };
+
+        // Update local channelData immediately for UI responsiveness
+        if (channelData[index]) {
+            channelData[index].active = channelUpdate.active;
+            channelData[index].label = channelUpdate.label;
+            channelData[index].reverse = channelUpdate.reverse;
+            channelData[index].phase = channelUpdate.phase;
+            channelData[index].groupLabel = channelUpdate.groupLabel;
+            channelData[index].role = channelUpdate.role;
+        }
+
+        // Store in queue - this will overwrite any previous update for this channel
+        updateQueue[index] = channelUpdate;
+
+        // Update UI responsiveness immediately
+        if (channelUpdate.active) {
+            startPowerUpdate(index);
+        } else {
+            stopPowerUpdate(index);
+        }
+
+        // Restart global power updates to include/exclude this channel
+        startGlobalPowerUpdates();
+
+        // Process updates after a short delay (debouncing)
+        if (!isProcessingUpdate) {
+            isProcessingUpdate = true;
+            setTimeout(processChannelUpdates, 500);
+        }
+    }
+
+    async function processChannelUpdates() {
+        if (Object.keys(updateQueue).length === 0) {
+            isProcessingUpdate = false;
+            return;
+        }
+
+        try {
+            showStatus('Updating channels...', '');
+
+            // Send all queued updates using PATCH for partial updates
+            const updates = Object.values(updateQueue);
+            updateQueue = {}; // Clear queue
+
+            for (const update of updates) {
+                await energyApi.patchChannelConfig(update);
+                scheduleReconcile(update.index, update);
+            }
+
+            showStatus('Channels updated successfully', 'success');
+
+        } catch (error) {
+            console.error('Error updating channels:', error);
+
+            if (error.message.includes('Channel 0 cannot be disabled')) {
+                showStatus('Channel 0 cannot be disabled', 'error');
+                // Reset channel 0 to active in UI
+                const activeCheckbox = document.getElementById('active0');
+                if (activeCheckbox) {
+                    activeCheckbox.checked = true;
+                }
+            } else {
+                showStatus('Error: ' + error.message, 'error');
+            }
+        }
+
+        isProcessingUpdate = false;
+
+        // If there are new updates in queue, process them
+        if (Object.keys(updateQueue).length > 0) {
+            setTimeout(processChannelUpdates, 500);
+        }
+    }
+
+    function scheduleReconcile(index, sentSnapshot) {
+        if (reconcileTimers[index]) {
+            clearTimeout(reconcileTimers[index]);
+        }
+        reconcileTimers[index] = setTimeout(() => {
+            delete reconcileTimers[index];
+            reconcileChannel(index, sentSnapshot);
+        }, RECONCILE_DELAY_MS);
+    }
+
+    async function reconcileChannel(index, sentSnapshot) {
+        // If a fresh edit is queued or in flight for this channel, skip - the
+        // user's latest action will be reconciled when its own timer fires.
+        if (updateQueue[index] !== undefined) return;
+
+        let serverChannel;
+        try {
+            const all = await energyApi.getChannelConfig();
+            serverChannel = all && all[index];
+        } catch (error) {
+            console.error('Reconcile fetch failed for channel', index, error);
+            return;
+        }
+        if (!serverChannel) return;
+
+        const fields = ['active', 'reverse', 'role', 'phase', 'label', 'groupLabel'];
+        const diffs = [];
+        fields.forEach(field => {
+            const sent = sentSnapshot[field];
+            const got = serverChannel[field];
+            if (sent === undefined) return;
+            if (sent === got) return;
+            diffs.push(field);
+        });
+
+        if (diffs.length === 0) {
+            // Still refresh local mirror so subsequent edits start from truth.
+            channelData[index] = serverChannel;
+            return;
+        }
+
+        diffs.forEach(field => applyServerFieldToDom(index, field, serverChannel[field]));
+        channelData[index] = serverChannel;
+
+        const label = serverChannel.label || `Channel ${index}`;
+        showStatus(`${label}: automatically adjusted ${diffs.join(', ')}`, 'info');
+    }
+
+    function applyServerFieldToDom(index, field, value) {
+        const el = document.getElementById(`${field}${index}`);
+        if (!el) return;
+        if (el.type === 'checkbox') {
+            el.checked = !!value;
+        } else if (el.tagName === 'SELECT') {
+            el.value = String(value);
+        } else {
+            el.value = value == null ? '' : value;
+        }
+        if (field === 'active') {
+            if (value) startPowerUpdate(index);
+            else stopPowerUpdate(index);
+            startGlobalPowerUpdates();
+        }
+    }
+
+    // Channel-scoped issue chips, fed by the issues.js poll. A chip appears next
+    // to the channel title whenever the registry has a visible issue for it;
+    // clicking opens the shared issues panel.
+    window.addEventListener('energyme-issues', (event) => {
+        const issues = (event.detail && event.detail.issues) || [];
+        Object.keys(channelData).forEach(index => {
+            const chip = document.getElementById(`issueChip${index}`);
+            if (chip) window.energymeIssues.renderChip(chip, issues.filter(i => i.channel == index));
+        });
+    });
+
+    async function resetChannelEnergy(channelIndex) {
+        const channel = channelData[channelIndex];
+        const label = channel ? channel.label : `Channel ${channelIndex}`;
+
+        if (!confirm(`Reset all energy values for "${label}" (Channel ${channelIndex}) to zero?\n\nThis will permanently delete all historical energy data for this channel.`)) {
+            return;
+        }
+
+        try {
+            await energyApi.resetEnergyValues(channelIndex);
+            showStatus(`Energy values reset for ${label}`, 'success');
+        } catch (error) {
+            showStatus('Error resetting energy: ' + error.message, 'error');
+        }
+    }</script>
+
+</html>

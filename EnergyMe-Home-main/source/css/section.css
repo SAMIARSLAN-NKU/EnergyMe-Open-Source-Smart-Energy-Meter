@@ -1,0 +1,57 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2025 Jibril Sharafi */
+
+.section-box {
+    width: 50%;
+    margin: 20px;
+    padding: 20px;
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    box-sizing: border-box;
+    background-color: white;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+    /* Mobile responsive adjustments */
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+/* Wide modifier - use as .section-box.wide */
+.section-box.wide {
+    width: 80%;
+}
+
+/* Mobile-first responsive design */
+@media screen and (max-width: 768px) {
+    .section-box {
+        width: 95%;
+        margin: 10px;
+        padding: 15px;
+        font-size: 14px;
+    }
+    
+    /* Ensure tables and forms fit on mobile */
+    .section-box table {
+        width: 100%;
+        overflow-x: auto;
+        display: block;
+        white-space: nowrap;
+    }
+    
+    .section-box input,
+    .section-box select,
+    .section-box textarea {
+        width: 100%;
+        max-width: 100%;
+        font-size: 16px; /* Prevents zoom on iOS */
+        box-sizing: border-box;
+    }
+}
+
+@media screen and (max-width: 480px) {
+    .section-box {
+        width: 98%;
+        margin: 5px;
+        padding: 12px;
+        font-size: 13px;
+    }
+}

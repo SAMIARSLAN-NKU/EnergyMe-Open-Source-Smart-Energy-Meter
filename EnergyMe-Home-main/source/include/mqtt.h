@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Jibril Sharafi
+
+#pragma once
+
+#include <AdvancedLogger.h>
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <PubSubClient.h>
+#include <StreamUtils.h>
+#include <WiFiClientSecure.h>
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
+#include "ade7953.h"
+#include "awsconfig.h"
+#include "constants.h"
+#include "factory_keys.h"
+#include "customtime.h"
+#include "customwifi.h"
+#include "customlog.h"
+#include "globals.h"
+#include "structs.h"
+#include "utils.h"
+
+#define MQTT_TASK_NAME "mqtt_task"
+#define MQTT_TASK_STACK_SIZE (7 * 1024) // Around 6 kB usage
+#define MQTT_TASK_PRIORITY 1 // Below AsyncTCP/web (priority 3) so user-facing requests preempt cloud publishing
+
+#define MQTT_LOG_QUEUE_SIZE (256 * 1024) // Generous log size (in bytes) thanks to PSRAM
+#define MQTT_METER_QUEUE_SIZE (64 * 1024) // Size in bytes to allocate to PSRAM
+#define QUEUE_WAIT_TIMEOUT 100 // Amount of milliseconds to wait if the queue is full or busy
+
+// AWS IoT Jobs OTA constants
+#define OTA_TASK_NAME "ota_task"
+#define OTA_TASK_STACK_SIZE (12 * 1024) // Has to be big to allow for the presigned S3 URL to be handled
+#define OTA_TASK_PRIORITY 5
+#define OTA_STATUS_CHECK_INTERVAL (1 * 1000)
+#define OTA_HTTPS_BUFFER_SIZE_TX (2 * 1024)
+#define OTA_PRESIGNED_URL_BUFFER_SIZE (4 * 1024) // The presigned S3 URL can be very long
+#define MQTT_OTA_SIZE_REPORT_UPDATE (128 * 1024)
+
+// OTA validation constants
+#define OTA_VALIDATION_TASK_NAME "ota_validation_task"
+#define OTA_VALIDATION_TASK_STACK_SIZE (6 * 1024)
+#define OTA_VALIDATION_TASK_PRIORITY 2
+#define OTA_VALIDATION_TIMEOUT (5 * 60 * 1000) // Stable operation before marking OTA as successful
+#define OTA_VALIDATION_CHECK_INTERVAL (10 * 1000) // Check periodically during validation period
+#define MQTT_PREFERENCES_OTA_JOB_ID_KEY "ota_job_id"
+#define MQTT_PREFERENCES_OTA_PENDING_KEY "ota_pending"
+#define MQTT_PREFERENCES_OTA_EXPECTED_SHA256_KEY "ota_sha256" // Expected firmware SHA256 for validation
+
+// MQTT buffer sizes - all moved to PSRAM for better memory utilization
+#define MQTT_BUFFER_SIZE (5 * 1024) // Needs to be at least 4 kB for the certificates
+#define MQTT_SUBSCRIBE_MESSAGE_BUFFER_SIZE (32 * 1024) // PSRAM buffer for MQTT subscribe messages (reduced for efficiency)
+#define CERTIFICATE_BUFFER_SIZE (16 * 1024)   // PSRAM buffer for certificate storage (was 4KB)
+#define MINIMUM_CERTIFICATE_LENGTH 128 // Minimum length for valid certificates (to avoid empty strings)
+#define CORE_DUMP_CHUNK_SIZE (4 * 1024) // Do not exceed 4kB to avoid stability issues
+
+#define DEFAULT_CLOUD_SERVICES_ENABLED false // Always off by default, and enabled only explicitly by the user
+#define DEFAULT_SEND_POWER_DATA_ENABLED true // Send all the data by default
+#define DEFAULT_MQTT_LOG_LEVEL_INT 2 // Default minimum log level for MQTT publishing (INFO = 2)
+
+#define MQTT_MAX_INTERVAL_METER_PUBLISH (60 * 1000) // The maximum interval between two meter payloads
+#ifdef ENV_DEV
+// In dev: send system_dynamic and statistics every minute so post-mortem
+// telemetry has the resolution needed to investigate behavior.
+#define MQTT_MAX_INTERVAL_SYSTEM_DYNAMIC_PUBLISH (60 * 1000)
+#define MQTT_MAX_INTERVAL_STATISTICS_PUBLISH (60 * 1000)
+#else
+#define MQTT_MAX_INTERVAL_SYSTEM_DYNAMIC_PUBLISH (60 * 60 * 1000)  // 1 hour since the data does not change frequently (and sent on reboot/reconnection anyway)
+#define MQTT_MAX_INTERVAL_STATISTICS_PUBLISH (6 * 60 * 60 * 1000)  // 6 hours since they are cumulative counters (and sent on reboot/reconnection anyway)
+#endif
+
+#define MQTT_OVERRIDE_KEEPALIVE 30 // 30 is the minimum value supported by AWS IoT Core (in seconds)
+
+#define MQTT_LOOP_INTERVAL 100 // Interval between two MQTT loop checks
+#define MQTT_METER_ESTIMATED_PER_ENTRY 35 // Estimated size in bytes of each meter entry (unix ms, channel, active power, pf)
+#define MQTT_METER_ESTIMATED_ENERGY_VOLTAGE_OVERHEAD_BYTES 500 // Estimated overhead in bytes for energy and voltage data in the payload
+#define AWS_IOT_CORE_MQTT_PAYLOAD_MINIMUM_BILLABLE (5 * 1024) // This is the minimum billable size for AWS IoT Core, so it makes little sense to send smaller payloads
+#define AWS_IOT_CORE_MQTT_PAYLOAD_LIMIT (128 * 1024) // Limit of AWS
+#define MQTT_METER_PAYLOAD_THRESHOLD_MULTIPLIER 0.95 // Multiplier to avoid reaching exactly the limit
+
+#define MQTT_INITIAL_RETRY_INTERVAL (15 * 1000) // Base delay for exponential backoff in milliseconds
+#define MQTT_MAX_RETRY_INTERVAL (60 * 60 * 1000) // Maximum delay for exponential backoff in milliseconds
+#define MQTT_RETRY_MULTIPLIER 2 // Multiplier for exponential backoff
+#define MQTT_MAX_CONNECTION_ATTEMPTS 10 // Maximum number of connection attempts before restarting the device. High since we don't want a reboot cycle
+#define MQTT_PREFERENCES_IS_CLOUD_SERVICES_ENABLED_KEY "en_cloud"
+#define MQTT_PREFERENCES_SEND_POWER_DATA_KEY "send_power"
+#define MQTT_PREFERENCES_MQTT_LOG_LEVEL_KEY "log_level_int"
+
+// MQTT topic suffixes (application-level; see awsconfig.h for the namespace prefix)
+// Publish topics
+#define MQTT_TOPIC_METER "meter"
+#define MQTT_TOPIC_SYSTEM_STATIC "system/static"
+#define MQTT_TOPIC_SYSTEM_DYNAMIC "system/dynamic"
+#define MQTT_TOPIC_CHANNEL "channel"
+#define MQTT_TOPIC_STATISTICS "statistics"
+#define MQTT_TOPIC_CRASH "crash"
+#define MQTT_TOPIC_LOG "log"
+// Subscribe topics
+#define MQTT_TOPIC_SUBSCRIBE_COMMAND "command"
+#define MQTT_TOPIC_SUBSCRIBE_JOBS "jobs"
+#define MQTT_TOPIC_SUBSCRIBE_QOS 1
+
+struct PublishMqtt
+{
+  bool meter;
+  bool systemDynamic;
+  bool systemStatic;
+  bool channel;
+  bool statistics;
+  bool crash;
+  bool requestOta;
+
+  PublishMqtt() : 
+    meter(false), // Need to fill queue first
+    systemDynamic(true), 
+    systemStatic(true), 
+    channel(true), 
+    statistics(true), 
+    crash(false), // May not be present
+    requestOta(true) {} // Always require on connection
+};
+
+namespace Mqtt
+{
+    void begin();
+    void stop();
+
+    // Cloud services methods
+    void setCloudServicesEnabled(bool enabled);
+    bool isCloudServicesEnabled();
+    bool isConnected(); // Connection fact for the issue registry (updated once per task loop)
+    
+    // Public methods for requesting MQTT publications
+    void requestChannelPublish();
+    void requestCrashPublish();
+    
+    // Public methods for pushing data to queues
+    void pushLog(const LogEntry& entry);
+    void pushMeter(const PayloadMeter& payload);
+
+    TaskInfo getMqttTaskInfo();
+    TaskInfo getMqttOtaTaskInfo();
+}

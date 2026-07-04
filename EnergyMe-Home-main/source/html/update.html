@@ -1,0 +1,749 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Copyright (C) 2025 Jibril Sharafi -->
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <link rel="stylesheet" type="text/css" href="/css/button.css">
+    <link rel="stylesheet" type="text/css" href="/css/styles.css">
+    <link rel="stylesheet" type="text/css" href="/css/section.css">
+    <link rel="stylesheet" type="text/css" href="/css/typography.css">
+    <link rel="stylesheet" type="text/css" href="/css/forms.css">
+    <link rel="stylesheet" type="text/css" href="/css/tooltip.css">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+
+    <title>Update</title>
+    <style>
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        .loading-content {
+            text-align: center;
+            color: white;
+            max-width: 80%;
+            background-color: rgba(0, 0, 0, 0);
+            padding: 20px;
+            border-radius: 10px;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        #loading-message {
+            font-style: italic;
+            color: grey;
+            margin-top: 10px;
+            background-color: #f3f3f3ee;
+            padding: 10px;
+            border-radius: 5px;
+            text-align: center;
+        }
+
+        /* Add this to your existing CSS */
+        .progress-circle {
+            stroke-dasharray: 565.48;
+            /* 2 * PI * 90 (radius) */
+            stroke-dashoffset: 565.48;
+            transform: rotate(-90deg);
+            transform-origin: center;
+            transition: stroke-dashoffset 0.3s ease;
+        }
+
+        .progress-ring {
+            margin: 0 auto;
+        }
+
+        .percent-text {
+            font-family: Arial, sans-serif;
+            font-weight: bold;
+        }
+
+        #result-message {
+            text-align: center;
+            padding: 10px;
+            margin-top: 10px;
+            border-radius: 5px;
+            display: block;
+        }
+        
+        /* Mobile responsive styles */
+        @media screen and (max-width: 768px) {
+            .loading-content {
+                max-width: 90%;
+                padding: 15px;
+            }
+            
+            #loading-message {
+                font-size: 14px;
+                padding: 8px;
+            }
+            
+            .progress-ring {
+                width: 100px;
+                height: 100px;
+            }
+            
+            .percent-text {
+                font-size: 16px;
+            }
+            
+            #result-message {
+                font-size: 14px;
+                padding: 8px;
+                margin: 10px 5px;
+            }
+            
+            input[type="file"] {
+                width: 100%;
+                padding: 10px;
+                font-size: 14px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                margin: 8px 0;
+                box-sizing: border-box;
+            }
+            
+            .warning-box {
+                font-size: 13px;
+                padding: 8px;
+                margin: 8px 0;
+            }
+        }
+        
+        @media screen and (max-width: 480px) {
+            .loading-content {
+                max-width: 95%;
+                padding: 12px;
+            }
+            
+            #loading-message {
+                font-size: 13px;
+                padding: 6px;
+            }
+            
+            .progress-ring {
+                width: 80px;
+                height: 80px;
+            }
+            
+            .percent-text {
+                font-size: 14px;
+            }
+            
+            input[type="file"] {
+                font-size: 13px;
+                padding: 8px;
+            }
+            
+            .warning-box {
+                font-size: 12px;
+                padding: 6px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="buttonNavigation-container">
+        <a class="buttonNavigation" type="home" href="/">🏠 Home</a>
+    </div>
+
+    <div id="loading-overlay" style="display: none;">
+        <div class="loading-content">
+            <p id="loading-message"></p>
+        </div>
+    </div>
+
+    <div id="result-message" style="display: none;"></div>
+
+    <div id="update" class="section-box">
+        <h2>Update</h2>
+        <p>Upload a new firmware to the device (only <i>.bin</i> files are allowed)</p>
+        <form method='POST' action='/api/v1/ota/upload' enctype='multipart/form-data' onsubmit="return formSubmitted(event)">
+            <input type='file' id='file' name='firmware' accept='.bin' required
+                title="Select the firmware .bin file to upload">
+            <input type='submit' id='submit' value='🚀 Update' title="Click to start the firmware update process">
+        </form>
+    </div>
+
+    <div id="current-device" class="section-box">
+        <h2>Current Firmware</h2>
+        <p><span class='list-key'>Version:</span><span id='current-firmware-version' class='list-value'></span></p>
+        <p><span class='list-key'>Date:</span><span id='current-firmware-date' class='list-value'></span></p>
+    </div>
+
+    <div id="update-info" class="section-box">
+        <h2>Latest update available</h2>
+        <div id="update-details" style="display: none;">
+            <p><span class='list-key'>Version:</span><span id='update-version' class='list-value'></span></p>
+            <p><span class='list-key'>Date:</span><span id='update-date' class='list-value'></span></p>
+            <p><span class='list-key'>URL:</span><a id='update-url' href='' target='_blank'
+                    title="Click to download the firmware update. Then, choose the file and click 'Update'">Download</a>
+            </p>
+            <p><span class='list-key'>Changelog:</span><a id='update-changelog' href='' target='_blank'
+                    title="Click to see the changelog">Changelog</a></p>
+        </div>
+        <p id="no-update" class="light-grey-box">Latest version installed</p>
+    </div>
+
+    <div id="rollback" class="section-box">
+        <h2>Firmware Rollback</h2>
+        <p>You can revert to the previous firmware version stored in the other partition. This is useful if the current
+            firmware has issues.</p>
+        <div class="warning-box"
+            style="background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            ⚠️ Warning: This will restart the device and switch to the previous firmware version.
+        </div> <button class="buttonForm" onclick="doRollback()" id="updateRollbackButton">🔄 Click to rollback to the
+            previous
+            firmware version</button>
+    </div>
+
+    <div id="backup-config" class="section-box">
+        <h2>Backup Configuration</h2>
+        <p>Download the current device configuration as a JSON file. This includes all NVS settings (channels, MQTT, InfluxDB, etc.)</p>
+        <button class="buttonForm" onclick="downloadConfigBackup()" id="backup-config-button">💾 Download Configuration Backup</button>
+    </div>
+
+    <div id="backup-filesystem" class="section-box">
+        <h2>Backup Filesystem</h2>
+        <p>Download all LittleFS files (energy data, logs, etc.) as a TAR archive. No temporary files are created on the device.</p>
+        <button class="buttonForm" onclick="downloadFilesystemBackup()" id="backup-filesystem-button">💾 Download Filesystem Backup</button>
+    </div>
+
+    <div id="restore-config" class="section-box">
+        <h2>Restore Configuration</h2>
+        <p>Upload a configuration backup JSON file to restore device settings. This will restore all NVS configuration data.</p>
+        <div class="warning-box"
+            style="background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            ⚠️ Warning: Device will restart after upload completes. Configuration is applied during boot.
+        </div>
+        <form method='POST' action='/api/v1/restore/configuration' enctype='multipart/form-data' onsubmit="return restoreConfigSubmitted(event)">
+            <input type='file' id='config-file' name='file' accept='.json' required
+                title="Select the configuration backup JSON file">
+            <label style="display: block; margin: 10px 0;">
+                <input type='checkbox' id='force-restore' name='force'>
+                Force restore (skip device ID check for cross-device restore)
+                <span class="info-tooltip">
+                    <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about force restore">ⓘ</button>
+                    <div class="info-tooltip-popover" role="tooltip">
+                        By default, a configuration backup can only be restored to the same device that created it (verified by device ID). Enable this to restore a backup from a different device. This is useful when replacing hardware with an identical unit.
+                    </div>
+                </span>
+            </label>
+            <input type='submit' id='restore-config-submit' value='📥 Restore Configuration' title="Click to restore configuration from backup">
+        </form>
+    </div>
+
+    <div id="restore-filesystem" class="section-box">
+        <h2>Restore Filesystem</h2>
+        <p>Upload a LittleFS backup TAR file to restore all files (energy data, logs, etc.). Existing files will be overwritten.</p>
+        <div class="warning-box"
+            style="background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            ⚠️ Warning: This will overwrite existing files with the same names from the backup.
+        </div>
+        <form method='POST' action='/api/v1/restore/filesystem' enctype='multipart/form-data' onsubmit="return restoreFilesystemSubmitted(event)">
+            <input type='file' id='filesystem-file' name='file' accept='.tar' required
+                title="Select the filesystem backup TAR file">
+            <input type='submit' id='restore-filesystem-submit' value='📥 Restore Filesystem' title="Click to restore filesystem from backup">
+        </form>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/spark-md5/3.0.2/spark-md5.min.js" integrity="sha512-iWbxiCA4l1WTD0rRctt/BfDEmDC5PiVqFc6c1Rhj/GKjuj6tqrjrikTw3Sypm/eEgMa7jSOS9ydmDlOtxJKlSQ==" crossorigin="anonymous"></script>
+    <script src="/js/api-client.js"></script>
+    <script src="/js/issues.js"></script>
+    <script src="/js/tooltip.js"></script>
+    <script>
+        var file_size = 341760; // Default to ESP32 firmware size to avoid division by zero
+        const UPDATE_PROGRESS_INTERVAL = 2000; // Lower values than 2000ms may overload the device
+
+        function getLoadingMessage() {
+            return "Please wait, this operation usually takes 10-20 seconds.<br>In the meantime, did you know that...<br><br>" + getRandomFact();
+        }
+
+        function getRandomFact() {
+            var facts = [
+                "The bugs are called bugs because the first computer bug was an actual moth found inside a computer.",
+                "The Egyptians are as far in time from the Romans as the Romans are from us.",
+                "You could fit all the planets in the solar system between the Earth and the Moon.",
+                "China and the USA alone account for almost 50% of the world's electricity consumption."
+            ];
+
+            var fact = facts[Math.floor(Math.random() * facts.length)];
+            return fact;
+        }
+
+        function updateProgress() {
+            if (document.getElementById('loading-overlay').style.display !== 'flex') {
+                return; // Stop if overlay is hidden
+            }
+
+            energyApi.getOtaStatus()
+                .then(data => {
+                    const percentage = Math.min(Math.floor(data.progressPercent || 0), 100);
+                    const circle = document.querySelector('.progress-circle');
+                    const percentText = document.querySelector('.percent-text');
+                    const circumference = 2 * Math.PI * 90; // radius is 90
+
+                    // Update circle progress
+                    const offset = circumference - (percentage / 100) * circumference;
+                    circle.style.strokeDashoffset = offset;
+
+                    // Update percentage text
+                    percentText.textContent = `${percentage}%`;
+
+                    if (percentage < 100 && data.status === 'running') {
+                        setTimeout(updateProgress, UPDATE_PROGRESS_INTERVAL);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching progress:', error);
+                    setTimeout(updateProgress, UPDATE_PROGRESS_INTERVAL);
+                });
+        }
+
+
+        function formSubmitted(event) {
+            if (!confirm("Are you sure you want to update the firmware?")) {
+                return false;
+            }
+
+            event.preventDefault(); // Prevent the form from submitting the traditional way
+
+            var resultMessageBox = document.getElementById('result-message');
+            resultMessageBox.style.display = 'none';
+
+            document.getElementById("submit").value = "Updating...";
+            document.getElementById("submit").disabled = true;
+            var previousColor = document.getElementById("submit").style.backgroundColor;
+
+            var fileInput = document.getElementById('file');
+            var file = fileInput.files[0];
+
+            function proceedWithUpdate(md5) {
+                var formData = new FormData();
+                formData.append('firmware', file);
+
+                // Set up headers
+                var headers = {};
+                if (md5) {
+                    headers['X-MD5'] = md5;
+                }
+
+                // Update progress overlay
+                document.getElementById('loading-overlay').innerHTML = `
+                    <div class="loading-content">
+                        <svg class="progress-ring" width="200" height="200">
+                            <circle class="progress-ring-bg" 
+                                cx="100" cy="100" r="90" 
+                                fill="transparent" 
+                                stroke="#f3f3f3" 
+                                stroke-width="16"/>
+                            <circle class="progress-circle" 
+                                cx="100" cy="100" r="90" 
+                                fill="transparent" 
+                                stroke="var(--green)" 
+                                stroke-width="16"
+                                stroke-linecap="round"/>
+                            <text class="percent-text" 
+                                x="100" y="100" 
+                                text-anchor="middle" 
+                                dominant-baseline="middle" 
+                                fill="white" 
+                                font-size="32">0%</text>
+                        </svg>
+                        <p id="loading-message"></p>
+                    </div>`;
+
+                document.getElementById('loading-overlay').style.display = 'flex';
+                document.getElementById('loading-message').innerHTML = getLoadingMessage();
+
+                // Start progress tracking
+                setTimeout(updateProgress, 2000);
+
+                fetch('/api/v1/ota/upload', {
+                    method: 'POST',
+                    body: formData,
+                    headers: headers
+                })
+                    .then(response => response.json())
+                    .then(data => {
+                        document.getElementById('loading-overlay').style.display = 'none';
+                        resultMessageBox.style.display = 'block';
+
+                        if (data.success || data.message) {
+                            resultMessageBox.style.backgroundColor = '#d4edda';
+                            resultMessageBox.style.color = '#155724';
+                            resultMessageBox.innerHTML = 'Update successful! The device will restart. Redirecting in 5 seconds...';
+
+                            document.getElementById("submit").value = "Update successful";
+                            document.getElementById("submit").style.backgroundColor = '#28a74550';
+
+                            setTimeout(function () {
+                                window.location.href = '/';
+                            }, 5000);
+                        } else {
+                            resultMessageBox.style.backgroundColor = '#f8d7da';
+                            resultMessageBox.style.color = '#721c24';
+                            resultMessageBox.innerHTML = 'Update failed: ' + (data.error || data.message || 'Unknown error');
+
+                            document.getElementById("submit").value = "Update failed";
+                            document.getElementById("submit").style.backgroundColor = '#dc354550';
+
+                            setTimeout(function () {
+                                document.getElementById("submit").value = "🚀 Update";
+                                document.getElementById("submit").disabled = false;
+                                document.getElementById("submit").style.backgroundColor = previousColor;
+                                resultMessageBox.style.display = 'none';
+                            }, 5000);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        document.getElementById('loading-overlay').style.display = 'none';
+
+                        resultMessageBox.style.backgroundColor = '#f8d7da';
+                        resultMessageBox.style.color = '#721c24';
+                        resultMessageBox.innerHTML = 'Update failed: ' + error.message;
+                        resultMessageBox.style.display = 'block';
+
+                        document.getElementById("submit").value = "Update failed";
+                        document.getElementById("submit").style.backgroundColor = '#dc354550';
+
+                        setTimeout(function () {
+                            document.getElementById("submit").value = "🚀 Update";
+                            document.getElementById("submit").disabled = false;
+                            document.getElementById("submit").style.backgroundColor = previousColor;
+                            resultMessageBox.style.display = 'none';
+                        }, 5000);
+                    });
+            }
+
+            file_size = file.size;
+
+            if (typeof SparkMD5 !== 'undefined') {
+                var reader = new FileReader();
+                reader.onload = function (e) {
+                    var binary = e.target.result;
+                    var md5 = SparkMD5.ArrayBuffer.hash(binary);
+                    proceedWithUpdate(md5);
+                };
+                reader.onerror = function () {
+                    console.warn('Failed to read file for MD5 calculation. Proceeding without MD5.');
+                    proceedWithUpdate('');
+                };
+                reader.readAsArrayBuffer(file);
+            } else {
+                console.warn('SparkMD5 not available. Proceeding without MD5 calculation.');
+                proceedWithUpdate('');
+            }
+
+            return false; // Prevent the form from submitting the traditional way
+        }
+
+        function getFirmwareUpdateInfo() {
+            energyApi.getFirmwareUpdateInfo()
+                .then(data => {
+                    // Populate current firmware info
+                    document.getElementById("current-firmware-version").innerHTML = data.currentVersion || 'N/A';
+                    document.getElementById("current-firmware-date").innerHTML = data.buildDate || 'N/A';
+
+                    // Populate update availability info
+                    updateFirmwareInfoUI(data);
+                })
+                .catch(error => {
+                    console.error('Error fetching firmware info:', error);
+                    document.getElementById("update-details").style.display = "none";
+                    document.getElementById("no-update").style.display = "block";
+                });
+        }        
+        
+        function updateFirmwareInfoUI(data) {
+            if (!data || (!data.availableVersion && data.isLatest)) {
+                document.getElementById("update-details").style.display = "none";
+                document.getElementById("no-update").style.display = "block";
+                return;
+            }
+
+            document.getElementById("update-version").innerHTML = data.availableVersion || 'N/A';
+
+            // Show the release date in the browser's local timezone (the API returns UTC ISO 8601).
+            let displayDate = data.buildDate || 'N/A';
+            if (data.releaseDate) {
+                const parsed = new Date(data.releaseDate);
+                displayDate = isNaN(parsed.getTime()) ? data.releaseDate : parsed.toLocaleString();
+            }
+            document.getElementById("update-date").innerHTML = displayDate;
+
+            if (data.updateUrl) {
+                document.getElementById("update-url").href = data.updateUrl;
+                document.getElementById("update-url").parentElement.style.display = "block";
+            } else {
+                document.getElementById("update-url").parentElement.style.display = "none";
+            }
+
+            if (data.changelogUrl) {
+                document.getElementById("update-changelog").href = data.changelogUrl;
+                document.getElementById("update-changelog").parentElement.style.display = "block";
+            } else {
+                document.getElementById("update-changelog").parentElement.style.display = "none";
+            }
+
+            // Show/hide update sections based on isLatest flag
+            if (data.isLatest) {
+                document.getElementById("update-details").style.display = "none";
+                document.getElementById("no-update").style.display = "block";
+            } else {
+                document.getElementById("update-details").style.display = "block";
+                document.getElementById("no-update").style.display = "none";
+            }
+        }
+
+        function saveFirmwareInfoLocally(firmwareInfo) {
+            // Optional: Save to localStorage for offline use
+            if (firmwareInfo) {
+                localStorage.setItem('latestFirmwareInfo', JSON.stringify(firmwareInfo));
+            }
+        }
+
+        function doRollback() {
+            if (!confirm("Are you sure you want to rollback to the previous firmware version? The device will restart.")) {
+                return;
+            }
+
+            energyApi.rollbackFirmware()
+                .then(data => {
+                    document.getElementById('loading-overlay').style.display = 'none';
+                    const resultMessageBox = document.getElementById('result-message');
+                    resultMessageBox.style.display = 'block';
+                    resultMessageBox.style.backgroundColor = '#d4edda';
+                    resultMessageBox.style.color = '#155724';
+                    resultMessageBox.innerHTML = 'Rollback initiated successfully! The device will restart shortly.';
+
+                    // Reload page after delay to see the rollback result
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 5000);
+                })
+                .catch(error => {
+                    console.error('Rollback failed:', error);
+                    document.getElementById('loading-overlay').style.display = 'none';
+                    const resultMessageBox = document.getElementById('result-message');
+                    resultMessageBox.style.display = 'block';
+                    resultMessageBox.style.backgroundColor = '#f8d7da';
+                    resultMessageBox.style.color = '#721c24';
+                    resultMessageBox.innerHTML = 'Rollback failed: ' + error.message;
+                    
+                    setTimeout(() => {
+                        resultMessageBox.style.display = 'none';
+                    }, 5000);
+                });
+        }
+
+        async function downloadConfigBackup() {
+            const button = document.getElementById('backup-config-button');
+            button.disabled = true;
+            button.classList.add('loading');
+
+            try {
+                showStatus('Downloading configuration backup...', 'info');
+
+                const blob = await energyApi.downloadConfigurationBackup();
+
+                // Create download link
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+
+                // Generate filename with timestamp
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                a.download = `config_backup_${timestamp}.json`;
+
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+
+                showStatus('Configuration backup downloaded successfully', 'success');
+            } catch (error) {
+                console.error('Configuration backup failed:', error);
+                showStatus('Backup failed: ' + error.message, 'error');
+            } finally {
+                button.disabled = false;
+                button.classList.remove('loading');
+            }
+        }
+
+        async function downloadFilesystemBackup() {
+            const button = document.getElementById('backup-filesystem-button');
+            button.disabled = true;
+            button.classList.add('loading');
+
+            try {
+                showStatus('Downloading filesystem backup...', 'info');
+                
+                const blob = await energyApi.downloadFilesystemBackup();
+
+                // Create download link
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+
+                // Generate filename with timestamp
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                a.download = `littlefs_backup_${timestamp}.tar`;
+
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+
+                showStatus('Filesystem backup downloaded successfully', 'success');
+            } catch (error) {
+                console.error('Filesystem backup failed:', error);
+                document.getElementById('loading-overlay').style.display = 'none';
+                showStatus('Backup failed: ' + error.message, 'error');
+            } finally {
+                button.disabled = false;
+                button.classList.remove('loading');
+            }
+        }
+
+        async function restoreConfigSubmitted(event) {
+            event.preventDefault();
+
+            const force = document.getElementById('force-restore').checked;
+            if (!confirm(`Are you sure you want to restore configuration${force ? ' (force mode - skipping device ID check)' : ''}? The device will restart.`)) {
+                return false;
+            }
+
+            const resultMessageBox = document.getElementById('result-message');
+            resultMessageBox.style.display = 'none';
+
+            const submitBtn = document.getElementById('restore-config-submit');
+            submitBtn.disabled = true;
+            submitBtn.classList.add('loading');
+
+            const fileInput = document.getElementById('config-file');
+            const file = fileInput.files[0];
+
+            // Show loading overlay
+            document.getElementById('loading-overlay').innerHTML = `
+                <div class="loading-content">
+                    <p id="loading-message"></p>
+                </div>`;
+            document.getElementById('loading-overlay').style.display = 'flex';
+            document.getElementById('loading-message').innerHTML =
+                "Restoring configuration...<br>Device will restart when complete.";
+
+            try {
+                showStatus('Restoring configuration...', 'info');
+
+                const data = await energyApi.restoreConfiguration(file, force);
+
+                document.getElementById('loading-overlay').style.display = 'none';
+                resultMessageBox.style.display = 'block';
+                resultMessageBox.style.backgroundColor = '#d4edda';
+                resultMessageBox.style.color = '#155724';
+                resultMessageBox.innerHTML = 'Configuration restore initiated! Device will restart shortly.';
+
+                // Device will restart - show message
+                setTimeout(() => {
+                    resultMessageBox.innerHTML = 'Device is restarting... Page will reload when ready.';
+                    // Try to reload after expected restart time
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 5000);
+                }, 3000);
+            } catch (error) {
+                console.error('Configuration restore failed:', error);
+                document.getElementById('loading-overlay').style.display = 'none';
+
+                resultMessageBox.style.backgroundColor = '#f8d7da';
+                resultMessageBox.style.color = '#721c24';
+                resultMessageBox.innerHTML = 'Restore failed: ' + error.message;
+                resultMessageBox.style.display = 'block';
+
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('loading');
+
+                setTimeout(() => {
+                    resultMessageBox.style.display = 'none';
+                }, 5000);
+            }
+
+            return false;
+        }
+
+        async function restoreFilesystemSubmitted(event) {
+            event.preventDefault();
+
+            if (!confirm('Are you sure you want to restore the filesystem? This will overwrite existing files.')) {
+                return false;
+            }
+
+            const submitBtn = document.getElementById('restore-filesystem-submit');
+            submitBtn.disabled = true;
+            submitBtn.classList.add('loading');
+
+            const fileInput = document.getElementById('filesystem-file');
+            const file = fileInput.files[0];
+
+            // Show loading overlay
+            document.getElementById('loading-overlay').innerHTML = `
+                <div class="loading-content">
+                    <p id="loading-message"></p>
+                </div>`;
+            document.getElementById('loading-overlay').style.display = 'flex';
+            document.getElementById('loading-message').innerHTML =
+                "Restoring filesystem...<br>This may take a moment depending on the archive size.";
+
+            try {
+                showStatus('Restoring filesystem...', 'info');
+
+                await energyApi.restoreFilesystem(file);
+
+                document.getElementById('loading-overlay').style.display = 'none';
+                showStatus('Filesystem restored successfully!', 'success');
+
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('loading');
+            } catch (error) {
+                console.error('Filesystem restore failed:', error);
+                document.getElementById('loading-overlay').style.display = 'none';
+                showStatus('Restore failed: ' + error.message, 'error');
+
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('loading');
+            }
+
+            return false;
+        }
+
+        document.addEventListener("DOMContentLoaded", function () {
+            getFirmwareUpdateInfo();
+        });
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,3305 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Jibril Sharafi
+
+#include "customserver.h"
+#include "taskprofiler.h"
+#include "duration_format.h"
+
+namespace CustomServer
+{
+    static TaskHeartbeat _healthCheckHeartbeat;
+
+    // Private variables
+    // ==============================
+    // ==============================
+
+    static AsyncWebServer server(WEBSERVER_PORT);
+    static AsyncAuthenticationMiddleware digestAuth;
+    static AsyncRateLimitMiddleware rateLimit;
+    static CustomMiddleware customMiddleware;
+
+    // Health check task variables
+    static TaskHandle_t _healthCheckTaskHandle = NULL;
+    static bool _healthCheckTaskShouldRun = false;
+    static uint32_t _consecutiveFailures = 0;
+
+    // OTA timeout task variables
+    static TaskHandle_t _otaTimeoutTaskHandle = NULL;
+    static bool _otaTimeoutTaskShouldRun = false;
+
+    // API request synchronization
+    static SemaphoreHandle_t _apiMutex = NULL;
+
+    // ETag for proper caching
+    static char _cachedEtag[MD5_BUFFER_SIZE + 3] = {0}; // +3 for quotes and null terminator
+    static bool _etagComputed = false;
+
+    // Private functions declarations
+    // ==============================
+    // ==============================
+
+    // Handlers and middlewares
+    static void _setupMiddleware();
+    static void _serveStaticContent();
+    static void _serveApi();
+
+    // Tasks
+    static void _startHealthCheckTask();
+    static void _stopHealthCheckTask();
+    static void _healthCheckTask(void *parameter);
+    static bool _performHealthCheck();
+
+    // OTA timeout task
+    static void _startOtaTimeoutTask();
+    static void _stopOtaTimeoutTask();
+    static void _otaTimeoutTask(void *parameter);
+
+    // Authentication management
+    static bool _setWebPassword(const char *password);
+    static bool _getWebPasswordFromPreferences(char *buffer, size_t bufferSize);
+    static bool _validatePasswordStrength(const char *password);
+
+    // Helper functions for common response patterns
+    static void _sendJsonResponse(AsyncWebServerRequest *request, const JsonDocument &doc, int32_t statusCode = HTTP_CODE_OK);
+    static void _sendSuccessResponse(AsyncWebServerRequest *request, const char *message);
+    static void _sendErrorResponse(AsyncWebServerRequest *request, int32_t statusCode, const char *message);
+
+    // API request synchronization helpers
+    static bool _acquireApiMutex(AsyncWebServerRequest *request);
+
+    // API endpoint groups
+    static void _serveSystemEndpoints();
+    static void _serveIssueEndpoints();
+    static void _serveNetworkEndpoints();
+    static void _serveLoggingEndpoints();
+    static void _serveHealthEndpoints();
+    static void _serveAuthEndpoints();
+    static void _serveOtaEndpoints();
+    static void _serveAde7953Endpoints();
+    static void _serveCustomMqttEndpoints();
+    static void _serveInfluxDbEndpoints();
+    static void _serveCrashEndpoints();
+    static void _serveLedEndpoints();
+    static void _serveBackupEndpoints();
+    static void _serveRestoreEndpoints();
+    static void _serveFileEndpoints();
+    
+    // Authentication endpoints
+    static void _serveAuthStatusEndpoint();
+    static void _serveChangePasswordEndpoint();
+    static void _serveResetPasswordEndpoint();
+    
+    // OTA endpoints
+    static void _serveOtaUploadEndpoint();
+    static void _serveOtaStatusEndpoint();
+    static void _serveOtaRollbackEndpoint();
+    static bool _fetchGitHubReleaseInfo(JsonDocument &doc);
+    static int _compareVersions(const char* current, const char* available);
+    static void _serveFirmwareStatusEndpoint();
+    static void _handleOtaUploadComplete(AsyncWebServerRequest *request);
+    static void _handleOtaUploadData(AsyncWebServerRequest *request, const String& filename, 
+                                   size_t index, uint8_t *data, size_t len, bool final);
+    
+    // File upload handler
+    static void _handleFileUploadData(AsyncWebServerRequest *request, const String& filename,
+                                    size_t index, uint8_t *data, size_t len, bool final);
+
+    // OTA helper functions
+    static bool _initializeOtaUpload(AsyncWebServerRequest *request, const String& filename);
+    static void _setupOtaMd5Verification(AsyncWebServerRequest *request);
+    static bool _writeOtaChunk(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index);
+    static void _finalizeOtaUpload(AsyncWebServerRequest *request);
+    
+    // Logging helper functions
+    static bool _parseLogLevel(const char *levelStr, LogLevel &level);
+    
+    // HTTP method validation helper
+    static bool _validateRequest(AsyncWebServerRequest *request, const char *expectedMethod, size_t maxContentLength = 0);
+    static bool _isPartialUpdate(AsyncWebServerRequest *request);
+    
+    // ETag validation helper
+    static bool _checkEtagAndSend304(AsyncWebServerRequest *request, const char* etag);
+    static void _sendResponseWithEtag(AsyncWebServerRequest *request, AsyncWebServerResponse *response, const char* etag);
+    
+    // Public functions
+    // ================
+    // ================
+
+    void begin()
+    {
+        LOG_DEBUG("Setting up web server...");
+
+        // Initialize API synchronization mutex
+        if (!createMutexIfNeeded(&_apiMutex)) {
+            LOG_ERROR("Failed to create API mutex");
+            return;
+        }
+        LOG_DEBUG("API mutex created successfully");
+
+        _setupMiddleware();
+        _serveStaticContent();
+        _serveApi();
+
+        server.begin();
+
+        LOG_INFO("Web server started on port %d", WEBSERVER_PORT);
+
+        // Start health check task to ensure the web server is responsive, and if it is not, restart the ESP32
+        _startHealthCheckTask();
+    }
+
+    void stop()
+    {
+        LOG_DEBUG("Stopping web server...");
+
+        // Stop health check task
+        _stopHealthCheckTask();
+
+        // Stop OTA timeout task
+        _stopOtaTimeoutTask();
+
+        // Stop the server
+        server.end();
+
+        // Delete API mutex
+        deleteMutex(&_apiMutex);
+        
+        LOG_DEBUG("Web server stopped");
+    }
+
+    void updateAuthPasswordWithOneFromPreferences()
+    {
+        char webPassword[PASSWORD_BUFFER_SIZE];
+        if (_getWebPasswordFromPreferences(webPassword, sizeof(webPassword)))
+        {
+            digestAuth.setPassword(webPassword);
+            digestAuth.generateHash(); // regenerate hash with new password
+            LOG_DEBUG("Authentication password updated");
+        }
+        else
+        {
+            LOG_ERROR("Failed to load new password for authentication");
+        }
+    }
+
+    bool resetWebPassword()
+    {
+        LOG_DEBUG("Resetting web password to default");
+        return _setWebPassword(WEBSERVER_DEFAULT_PASSWORD);
+    }
+
+    // Private functions
+    // =================
+    // =================
+
+    static void _setupMiddleware()
+    {
+        // ---- Statistics Middleware Setup ----
+        // Add statistics tracking middleware first to capture all requests
+        server.addMiddleware(&customMiddleware);
+        LOG_DEBUG("Statistics middleware configured");
+
+        // ---- Authentication Middleware Setup ----
+        // Configure digest authentication (more secure than basic auth)
+        digestAuth.setUsername(WEBSERVER_DEFAULT_USERNAME);
+
+        // Load password from Preferences or use default
+        char webPassword[PASSWORD_BUFFER_SIZE];
+        if (_getWebPasswordFromPreferences(webPassword, sizeof(webPassword)))
+        {
+            digestAuth.setPassword(webPassword);
+            LOG_DEBUG("Web password loaded from Preferences");
+        }
+        else
+        {
+            // Fallback to default password if Preferences failed
+            digestAuth.setPassword(WEBSERVER_DEFAULT_PASSWORD);
+            LOG_INFO("Failed to load web password, using default");
+
+            // Try to initialize the password in Preferences for next time
+            if (_setWebPassword(WEBSERVER_DEFAULT_PASSWORD)) { LOG_DEBUG("Default password saved to Preferences for future use"); }
+        }
+
+        digestAuth.setRealm(WEBSERVER_REALM);
+        digestAuth.setAuthFailureMessage("The password is incorrect. Please try again.");
+        digestAuth.setAuthType(AsyncAuthType::AUTH_DIGEST);
+        digestAuth.generateHash(); // precompute hash for better performance
+
+        server.addMiddleware(&digestAuth);
+
+        LOG_DEBUG("Digest authentication configured");
+
+        // ---- Rate Limiting Middleware Setup ----
+        // Set rate limiting to prevent abuse
+        rateLimit.setMaxRequests(WEBSERVER_MAX_REQUESTS);
+        rateLimit.setWindowSize(WEBSERVER_WINDOW_SIZE_SECONDS);
+
+        server.addMiddleware(&rateLimit);
+
+        LOG_DEBUG("Rate limiting configured: max requests = %d, window size = %d seconds", WEBSERVER_MAX_REQUESTS, WEBSERVER_WINDOW_SIZE_SECONDS);
+
+        LOG_DEBUG("Logging middleware configured");
+    }
+
+    // Helper functions for common response patterns
+    static void _sendJsonResponse(AsyncWebServerRequest *request, const JsonDocument &doc, int32_t statusCode)
+    {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        response->setCode(statusCode);
+        serializeJson(doc, *response);
+        request->send(response);
+    }
+
+    static void _sendSuccessResponse(AsyncWebServerRequest *request, const char *message)
+    {
+        SpiRamAllocator allocator;
+        JsonDocument doc(&allocator);
+        doc["success"] = true;
+        doc["message"] = message;
+        _sendJsonResponse(request, doc, HTTP_CODE_OK);
+
+        releaseMutex(&_apiMutex);
+    }
+
+    static void _sendErrorResponse(AsyncWebServerRequest *request, int32_t statusCode, const char *message)
+    {
+        SpiRamAllocator allocator;
+        JsonDocument doc(&allocator);
+        doc["success"] = false;
+        doc["error"] = message;
+        _sendJsonResponse(request, doc, statusCode);
+
+        releaseMutex(&_apiMutex);
+    }
+
+    static bool _acquireApiMutex(AsyncWebServerRequest *request)
+    {
+        if (!acquireMutex(&_apiMutex, API_MUTEX_TIMEOUT_MS)) {
+            LOG_WARNING("Failed to acquire API mutex within timeout");
+            _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Server busy, please try again");
+            return false;
+        }
+
+        LOG_DEBUG("API mutex acquired for request: %s", request->url().c_str());
+        return true;
+    }
+
+    // Helper function to parse log level strings
+    static bool _parseLogLevel(const char *levelStr, LogLevel &level)
+    {
+        if (!levelStr) return false;
+        
+        if (strcmp(levelStr, "VERBOSE") == 0)
+            level = LogLevel::VERBOSE;
+        else if (strcmp(levelStr, "DEBUG") == 0)
+            level = LogLevel::DEBUG;
+        else if (strcmp(levelStr, "INFO") == 0)
+            level = LogLevel::INFO;
+        else if (strcmp(levelStr, "WARNING") == 0)
+            level = LogLevel::WARNING;
+        else if (strcmp(levelStr, "ERROR") == 0)
+            level = LogLevel::ERROR;
+        else if (strcmp(levelStr, "FATAL") == 0)
+            level = LogLevel::FATAL;
+        else
+            return false;
+            
+        return true;
+    }
+
+    // Helper function to validate HTTP method
+    // We cannot do setMethod since it makes all PUT requests fail (404) for some weird reason
+    // It is not too bad anyway since like this we have full control over the response
+    static bool _validateRequest(AsyncWebServerRequest *request, const char *expectedMethod, size_t maxContentLength)
+    {
+        if (maxContentLength > 0 && request->contentLength() > maxContentLength)
+        {
+            char errorMsg[STATUS_BUFFER_SIZE];
+            snprintf(errorMsg, sizeof(errorMsg), "Payload Too Large. Max: %zu", maxContentLength);
+            _sendErrorResponse(request, HTTP_CODE_PAYLOAD_TOO_LARGE, errorMsg);
+            return false;
+        }
+
+        if (strcmp(request->methodToString(), expectedMethod) != 0)
+        {
+            char errorMsg[STATUS_BUFFER_SIZE];
+            snprintf(errorMsg, sizeof(errorMsg), "Method Not Allowed. Use %s.", expectedMethod);
+            _sendErrorResponse(request, HTTP_CODE_METHOD_NOT_ALLOWED, errorMsg);
+            return false;
+        }
+
+        return _acquireApiMutex(request);
+    }
+
+    static bool _isPartialUpdate(AsyncWebServerRequest *request)
+    {
+        // Check if the request method is PATCH (partial update) or PUT (full update)
+        if (!request) return false; // Safety check
+
+        const char* method = request->methodToString();
+        bool isPartialUpdate = (strcmp(method, "PATCH") == 0);
+
+        return isPartialUpdate;
+    }
+
+    static void _startHealthCheckTask()
+    {
+        if (_healthCheckTaskHandle != NULL)
+        {
+            LOG_DEBUG("Health check task is already running");
+            return;
+        }
+
+        LOG_DEBUG("Starting health check task with %d bytes stack in internal RAM (performs TCP network operations)", HEALTH_CHECK_TASK_STACK_SIZE);
+        _consecutiveFailures = 0;
+
+        BaseType_t result = xTaskCreate(
+            _healthCheckTask,
+            HEALTH_CHECK_TASK_NAME,
+            HEALTH_CHECK_TASK_STACK_SIZE,
+            NULL,
+            HEALTH_CHECK_TASK_PRIORITY,
+            &_healthCheckTaskHandle);
+
+        if (result != pdPASS) { 
+            LOG_ERROR("Failed to create health check task"); 
+        }
+    }
+
+    static void _stopHealthCheckTask() { 
+        stopTaskGracefully(&_healthCheckTaskHandle, "Health check task");
+    }
+
+    static void _startOtaTimeoutTask()
+    {
+        if (_otaTimeoutTaskHandle != NULL)
+        {
+            LOG_DEBUG("OTA timeout task is already running");
+            return;
+        }
+
+        LOG_DEBUG("Starting OTA timeout task with %d bytes stack in internal RAM (uses flash I/O)", OTA_TIMEOUT_TASK_STACK_SIZE);
+
+        BaseType_t result = xTaskCreate(
+            _otaTimeoutTask,
+            OTA_TIMEOUT_TASK_NAME,
+            OTA_TIMEOUT_TASK_STACK_SIZE,
+            NULL,
+            OTA_TIMEOUT_TASK_PRIORITY,
+            &_otaTimeoutTaskHandle);
+
+        if (result != pdPASS) { 
+            LOG_ERROR("Failed to create OTA timeout task"); 
+            _otaTimeoutTaskHandle = NULL;
+        }
+    }
+
+    static void _stopOtaTimeoutTask() { 
+        stopTaskGracefully(&_otaTimeoutTaskHandle, "OTA timeout task"); 
+    }
+
+    static void _otaTimeoutTask(void *parameter)
+    {
+        LOG_DEBUG("OTA timeout task started - system will reboot in %d seconds if OTA doesn't complete", OTA_TIMEOUT / 1000);
+
+        _otaTimeoutTaskShouldRun = true;
+        
+        uint32_t notificationValue = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(OTA_TIMEOUT));
+        
+        // If everything goes well, we will never reach here
+        if (notificationValue == 0 && _otaTimeoutTaskShouldRun) {
+            // Timeout occurred and task wasn't stopped - force reboot
+            LOG_ERROR("OTA timeout exceeded (%d seconds), forcing system restart", OTA_TIMEOUT / 1000);
+            setRestartSystem("OTA process timeout - forcing restart for system recovery");
+        } else {
+            LOG_DEBUG("OTA timeout task stopped normally");
+        }
+
+        _otaTimeoutTaskHandle = NULL;
+        vTaskDelete(NULL);
+    }
+
+    static void _healthCheckTask(void *parameter)
+    {
+        LOG_DEBUG("Health check task started");
+
+        _healthCheckTaskShouldRun = true;
+        while (_healthCheckTaskShouldRun)
+        {
+            TASK_HEARTBEAT(_healthCheckHeartbeat);
+
+            // Perform health check
+            if (_performHealthCheck())
+            {
+                // Reset failure counter on success
+                if (_consecutiveFailures > 0)
+                {
+                    LOG_INFO("Health check recovered after %d failures", _consecutiveFailures);
+                    _consecutiveFailures = 0;
+                }
+                LOG_DEBUG("Health check passed");
+            }
+            else
+            {
+                _consecutiveFailures++;
+                LOG_WARNING("Health check failed (attempt %d/%d)", _consecutiveFailures, HEALTH_CHECK_MAX_FAILURES);
+
+                if (_consecutiveFailures >= HEALTH_CHECK_MAX_FAILURES)
+                {
+                    LOG_ERROR("Health check failed %d consecutive times, requesting system restart", HEALTH_CHECK_MAX_FAILURES);
+                    setRestartSystem("Server health check failures exceeded maximum threshold");
+                    break; // Exit the task as we're restarting
+                }
+            }
+
+            // Wait for stop notification with timeout (blocking) - zero CPU usage while waiting
+            if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HEALTH_CHECK_INTERVAL_MS)) > 0)
+            {
+                _healthCheckTaskShouldRun = false;
+                break;
+            }
+        }
+
+        LOG_DEBUG("Health check task stopping");
+        _healthCheckTaskHandle = NULL;
+        vTaskDelete(NULL);
+    }
+
+    static bool _performHealthCheck()
+    {
+        // Check if WiFi is connected
+        if (!CustomWifi::isFullyConnected())
+        {
+            LOG_DEBUG("Health check: WiFi not connected");
+            return false;
+        }
+
+        // Perform a simple HTTP self-request to verify server responsiveness
+        WiFiClient client;
+        client.setTimeout(HEALTH_CHECK_TIMEOUT_MS);
+
+        if (!client.connect("127.0.0.1", WEBSERVER_PORT))
+        {
+            LOG_WARNING("Health check failed: Cannot connect to local web server");
+            return false;
+        }
+
+        // Send a simple GET request to the health endpoint
+        client.print("GET /api/v1/health HTTP/1.1\r\n");
+        client.print("Host: 127.0.0.1\r\n");
+        client.print("Connection: close\r\n\r\n");
+
+        // Wait for response with timeout
+        uint64_t startTime = millis64();
+        uint32_t loops = 0;
+        while (client.connected() && (millis64() - startTime) < HEALTH_CHECK_TIMEOUT_MS && loops < MAX_LOOP_ITERATIONS)
+        {
+            loops++;
+
+            // Reset task watchdog periodically during HTTP wait
+            if (loops % 50 == 0) {
+                esp_task_wdt_reset();
+            }
+
+            if (client.available())
+            {
+                char line[HTTP_HEALTH_CHECK_RESPONSE_BUFFER_SIZE];
+                size_t bytesRead = client.readBytesUntil('\n', line, sizeof(line) - 1);
+                line[bytesRead] = '\0';
+
+                if (strncmp(line, "HTTP/1.1 ", 9) == 0 && bytesRead >= 12)
+                {
+                    // Extract status code from characters 9-11
+                    char statusStr[4] = {line[9], line[10], line[11], '\0'};
+                    int32_t statusCode = atoi(statusStr);
+                    client.stop();
+
+                    if (statusCode == HTTP_CODE_OK)
+                    {
+                        LOG_DEBUG("Health check passed: HTTP OK");
+                        return true;
+                    }
+                    else
+                    {
+                        LOG_WARNING("Health check failed: HTTP status code %d", statusCode);
+                        return false;
+                    }
+                }
+            }
+            delay(10); // Small delay to prevent busy waiting
+        }
+
+        client.stop();
+        LOG_WARNING("Health check failed: HTTP request timeout");
+        return false;
+    }
+
+    // Password management functions
+    // ------------------------------
+    static bool _setWebPassword(const char *password)
+    {
+        if (!_validatePasswordStrength(password))
+        {
+            LOG_ERROR("Password does not meet strength requirements");
+            return false;
+        }
+
+        Preferences prefs;
+        if (!prefs.begin(PREFERENCES_NAMESPACE_AUTH, false))
+        {
+            LOG_ERROR("Failed to open auth preferences for writing");
+            return false;
+        }
+
+        bool success = prefs.putString(PREFERENCES_KEY_PASSWORD, password) > 0;
+        prefs.end();
+
+        if (success) { LOG_INFO("Web password updated successfully"); }
+        else { LOG_ERROR("Failed to save web password"); }
+
+        return success;
+    }
+
+    static bool _getWebPasswordFromPreferences(char *buffer, size_t bufferSize)
+    {
+        LOG_DEBUG("Getting web password");
+
+        if (buffer == nullptr || bufferSize == 0)
+        {
+            LOG_ERROR("Invalid buffer for getWebPassword");
+            return false;
+        }
+
+        Preferences prefs;
+        if (!prefs.begin(PREFERENCES_NAMESPACE_AUTH, true))
+        {
+            LOG_ERROR("Failed to open auth preferences for reading");
+            return false;
+        }
+
+        size_t res = prefs.getString(PREFERENCES_KEY_PASSWORD, buffer, bufferSize);
+        prefs.end();
+
+        return res > 0 && res < bufferSize; // Ensure we don't return true if the password is actually null or too long
+    }
+    
+    // Only check length - there is no need to be picky here
+    static bool _validatePasswordStrength(const char *password)
+    {
+        if (password == nullptr) { return false; }
+
+        size_t length = strlen(password);
+
+        // Check minimum length
+        if (length < MIN_PASSWORD_LENGTH)
+        {
+            LOG_WARNING("Password too short (min %d characters)", MIN_PASSWORD_LENGTH);
+            return false;
+        }
+
+        // Check maximum length
+        if (length > MAX_PASSWORD_LENGTH)
+        {
+            LOG_WARNING("Password too long (max %d characters)", MAX_PASSWORD_LENGTH);
+            return false;
+        }
+        
+        return true;
+    }
+
+    static void _serveApi()
+    {
+        // Group endpoints by functionality
+        _serveSystemEndpoints();
+        _serveIssueEndpoints();
+        _serveNetworkEndpoints();
+        _serveLoggingEndpoints();
+        _serveHealthEndpoints();
+        _serveAuthEndpoints();
+        _serveOtaEndpoints();
+        _serveAde7953Endpoints();
+        _serveCustomMqttEndpoints();
+        _serveInfluxDbEndpoints();
+        _serveCrashEndpoints();
+        _serveLedEndpoints();
+        _serveBackupEndpoints();
+        _serveRestoreEndpoints();
+        _serveFileEndpoints();
+    }
+
+    // ETag helper functions for caching
+    // =================================
+
+    /**
+     * Check ETag validity and send 304 Not Modified if matched
+     * Returns true if 304 was sent (caller should return), false otherwise (continue processing)
+     */
+    static bool _checkEtagAndSend304(AsyncWebServerRequest *request, const char* etag)
+    {
+        if (request->hasHeader("If-None-Match")) {
+            const String& clientEtag = request->header("If-None-Match");
+            if (clientEtag == etag) {
+                request->send(HTTP_CODE_NOT_MODIFIED);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Add ETag and Cache-Control headers, then send response
+     */
+    static void _sendResponseWithEtag(AsyncWebServerRequest *request, AsyncWebServerResponse *response, const char* etag)
+    {
+        response->addHeader("Cache-Control", "no-cache"); // Always validate with server
+        response->addHeader("ETag", etag);
+        request->send(response);
+    }
+
+    /**
+     * Get sketch MD5 hash as ETag for cache busting
+     * Cached in static variable - computed once on first call
+     * Returns ETag in format: "abc123def456..."
+     */
+    static const char* _getSketchEtag()
+    {        
+        if (!_etagComputed) {
+            snprintf(_cachedEtag, sizeof(_cachedEtag), "\"%s\"", ESP.getSketchMD5().c_str());
+            _etagComputed = true;
+            LOG_DEBUG("Sketch ETag created (and saved in static variable): %s", _cachedEtag);
+        }
+        
+        return _cachedEtag;
+    }
+
+    /**
+     * Generate ETag from file metadata
+     * Uses file size as primary identifier 
+     * Should be very accurate for append-only files like csv energy data and txt logs)
+     */
+    static const char* _generateFileEtag(const char* filename) {
+        File file = LittleFS.open(filename, "r");
+        if (!file) return "";
+        
+        size_t fileSize = file.size();
+        file.close();
+        
+        // Use file size as ETag - simple and effective for append-only files
+        // Format: "size-{bytes}" e.g. "size-59635"
+        static char etagBuffer[32];
+        snprintf(etagBuffer, sizeof(etagBuffer), "\"size-%u\"", (unsigned)fileSize);
+        return etagBuffer;
+    }
+
+    /**
+     * Send static content with ETag validation
+     * If client sends matching If-None-Match header, responds with 304 Not Modified (no body)
+     * Otherwise sends full content with ETag and Cache-Control headers
+     */
+    static void _sendStaticWithEtag(AsyncWebServerRequest *request, const char* contentType, const uint8_t* content, size_t len, const char* etag)
+    {
+        // Check if client sent matching ETag
+        if (_checkEtagAndSend304(request, etag)) return;
+
+        // ETag doesn't match or not provided - stream full content from flash
+        // (uint8_t* + size_t overload constructs AsyncProgmemResponse, which reads
+        // chunks directly from flash via memcpy_P; no heap copy of the body, vs
+        // the const char* overload that copies the entire file into a String and
+        // can corrupt under concurrent parallel requests on a fragmented heap)
+        AsyncWebServerResponse *response = request->beginResponse(HTTP_CODE_OK, contentType, content, len);
+        _sendResponseWithEtag(request, response, etag);
+    }
+
+    /**
+     * Send file with ETag validation
+     * If client sends matching If-None-Match header, responds with 304 Not Modified
+     * Otherwise streams file content with ETag and Cache-Control headers
+     */
+    static void _sendFileWithEtag(AsyncWebServerRequest *request, const char* filename, const char* contentType, bool forceDownload = false)
+    {
+        // Generate ETag from file metadata
+        const char* etag = _generateFileEtag(filename);
+        
+        if (strlen(etag) == 0) {
+            _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to generate ETag");
+            return;
+        }
+        
+        // Check if client sent matching ETag
+        if (_checkEtagAndSend304(request, etag)) return;
+        
+        // ETag doesn't match or not provided - send full file
+        AsyncWebServerResponse *response = request->beginResponse(LittleFS, filename, contentType, forceDownload);
+        
+        if (!response) {
+            _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to create response");
+            return;
+        }
+        
+        _sendResponseWithEtag(request, response, etag);
+    }
+
+    // === STATIC CONTENT SERVING ===
+    static void _serveStaticContent()
+    {
+        // Cache strategy: "no-cache" with ETag validation
+        // - Browser always asks server before using cache
+        // - Server responds 304 Not Modified (no body) if ETag matches → fast
+        // - Server responds 200 OK with full content if ETag differs → always fresh
+        // When firmware is updated, sketch MD5 changes → ETag differs → fresh content
+
+        // This needs to be a solid pointer, so we need a static variable
+        // that will persist for the server's lifetime
+        const char* etag = _getSketchEtag();
+
+        // CSS files
+        server.on("/css/button.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(button_css), etag);
+        });
+        server.on("/css/forms.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(forms_css), etag);
+        });
+        server.on("/css/index.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(index_css), etag);
+        });
+        server.on("/css/styles.css", HTTP_GET, [etag](AsyncWebServerRequest *request) { 
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(styles_css), etag);
+        });
+        server.on("/css/section.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(section_css), etag);
+        });
+        server.on("/css/tooltip.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(tooltip_css), etag);
+        });
+        server.on("/css/typography.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", EMBEDDED(typography_css), etag);
+        });
+
+        // JavaScript files
+        server.on("/js/api-client.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", EMBEDDED(api_client_js), etag);
+        });
+        server.on("/js/chart-helpers.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", EMBEDDED(chart_helpers_js), etag);
+        });
+        server.on("/js/data-helpers.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", EMBEDDED(data_helpers_js), etag);
+        });
+        server.on("/js/issues.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", EMBEDDED(issues_js), etag);
+        });
+        server.on("/js/power-flow.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", EMBEDDED(power_flow_js), etag);
+        });
+        server.on("/js/tooltip.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", EMBEDDED(tooltip_js), etag);
+        });
+
+        // Resources
+        server.on("/favicon.svg", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "image/svg+xml", EMBEDDED(favicon_svg), etag);
+        });
+
+        // Main dashboard
+        server.on("/", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(index_html), etag);
+        });
+
+        // Configuration pages
+        server.on("/ade7953-tester", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(ade7953_tester_html), etag);
+        });
+        server.on("/configuration", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(configuration_html), etag);
+        });
+        server.on("/calibration", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(calibration_html), etag);
+        });
+        server.on("/channel", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(channel_html), etag);
+        });
+        server.on("/info", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(info_html), etag);
+        });
+        server.on("/integrations", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(integrations_html), etag);
+        });
+        server.on("/log", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(log_html), etag);
+        });
+        server.on("/update", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(update_html), etag);
+        });
+        server.on("/waveform", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(waveform_html), etag);
+        });
+
+        // Swagger UI
+        server.on("/swagger-ui", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/html", EMBEDDED(swagger_ui_html), etag);
+        });
+        server.on("/swagger.yaml", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/yaml", EMBEDDED(swagger_yaml), etag);
+        });
+    }
+
+    // === HEALTH ENDPOINTS ===
+    static void _serveHealthEndpoints()
+    {
+        server.on("/api/v1/health", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            doc["status"] = "ok";
+            doc["uptime"] = millis64();
+            char timestamp[TIMESTAMP_ISO_BUFFER_SIZE];
+            CustomTime::getTimestampIso(timestamp, sizeof(timestamp));
+            doc["timestamp"] = timestamp;
+
+            _sendJsonResponse(request, doc);
+        }).skipServerMiddlewares(); // For the health endpoint, no authentication or rate limiting
+    }
+
+    // === AUTHENTICATION ENDPOINTS ===
+    static void _serveAuthEndpoints()
+    {
+        _serveAuthStatusEndpoint();
+        _serveChangePasswordEndpoint();
+        _serveResetPasswordEndpoint();
+    }
+
+    static void _serveAuthStatusEndpoint()
+    {
+        server.on("/api/v1/auth/status", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            // Check if using default password
+            char currentPassword[PASSWORD_BUFFER_SIZE];
+            bool isDefault = true;
+            if (_getWebPasswordFromPreferences(currentPassword, sizeof(currentPassword))) {
+                isDefault = (strcmp(currentPassword, WEBSERVER_DEFAULT_PASSWORD) == 0);
+            }
+            
+            doc["usingDefaultPassword"] = isDefault;
+            doc["username"] = WEBSERVER_DEFAULT_USERNAME;
+            
+            _sendJsonResponse(request, doc);
+        });
+    }
+
+    static void _serveChangePasswordEndpoint()
+    {
+        static AsyncCallbackJsonWebHandler *changePasswordHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/auth/change-password",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "POST", HTTP_MAX_CONTENT_LENGTH_PASSWORD)) return;
+
+                SpiRamAllocator allocator;
+        JsonDocument doc(&allocator);
+                doc.set(json);
+
+                const char *currentPassword = doc["currentPassword"];
+                const char *newPassword = doc["newPassword"];
+
+                if (!currentPassword || !newPassword)
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing currentPassword or newPassword");
+                    return;
+                }
+
+                // Validate current password
+                char storedPassword[PASSWORD_BUFFER_SIZE];
+                if (!_getWebPasswordFromPreferences(storedPassword, sizeof(storedPassword)))
+                {
+                    _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve current password");
+                    return;
+                }
+
+                if (strcmp(currentPassword, storedPassword) != 0)
+                {
+                    _sendErrorResponse(request, HTTP_CODE_UNAUTHORIZED, "Current password is incorrect");
+                    return;
+                }
+
+                // Validate and save new password
+                if (!_setWebPassword(newPassword))
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "New password does not meet requirements or failed to save");
+                    return;
+                }
+
+                LOG_INFO("Password changed successfully via API");
+                _sendSuccessResponse(request, "Password changed successfully");
+                
+                // Update authentication middleware with new password
+                updateAuthPasswordWithOneFromPreferences();
+            });
+        server.addHandler(changePasswordHandler);
+    }
+
+    static void _serveResetPasswordEndpoint()
+    {
+        server.on("/api/v1/auth/reset-password", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (resetWebPassword()) {
+                updateAuthPasswordWithOneFromPreferences();
+                LOG_WARNING("Password reset to default via API");
+                _sendSuccessResponse(request, "Password reset to default");
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to reset password");
+            }
+        });
+    }
+
+    // === OTA UPDATE ENDPOINTS ===
+    static void _serveOtaEndpoints()
+    {
+        _serveOtaUploadEndpoint();
+        _serveOtaStatusEndpoint();
+        _serveOtaRollbackEndpoint();
+        _serveFirmwareStatusEndpoint();
+    }
+
+    static void _serveOtaUploadEndpoint()
+    {
+        server.on("/api/v1/ota/upload", HTTP_POST, 
+            _handleOtaUploadComplete,
+            _handleOtaUploadData);
+    }
+
+    static void _handleOtaUploadComplete(AsyncWebServerRequest *request)
+    {
+        // Handle the completion of the upload
+        if (request->getResponse()) return;  // Response already set due to error
+
+        // Stop OTA timeout task since OTA process is completing
+        _stopOtaTimeoutTask();
+
+        if (Update.hasError()) {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["success"] = false;
+            doc["message"] = Update.errorString();
+            _sendJsonResponse(request, doc);
+            
+            LOG_ERROR("OTA update failed: %s", Update.errorString());
+            Update.printError(Serial);
+            
+            Led::blinkRedFast(Led::PRIO_CRITICAL, 5000ULL);
+            
+            // Schedule restart even on failure for system recovery
+            setRestartSystem("Restart needed after failed firmware update for system recovery");
+        } else {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            doc["success"] = true;
+            doc["message"] = "Firmware update completed successfully";
+            doc["md5"] = Update.md5String();
+            _sendJsonResponse(request, doc);
+            
+            LOG_INFO("OTA update completed successfully");
+            LOG_DEBUG("New firmware MD5: %s", Update.md5String().c_str());
+            
+            Led::blinkGreenFast(Led::PRIO_CRITICAL, 3000ULL);
+            setRestartSystem("Restart needed after firmware update");
+        }
+    }
+
+    static void _handleOtaUploadData(AsyncWebServerRequest *request, const String& filename, 
+                                   size_t index, uint8_t *data, size_t len, bool final)
+    {
+        static bool otaInitialized = false;
+        
+        if (!index) {
+            // First chunk - initialize OTA
+            if (!_initializeOtaUpload(request, filename)) {
+                return;
+            }
+            otaInitialized = true;
+        }
+        
+        // Write chunk to flash
+        if (len && otaInitialized) {
+            if (!_writeOtaChunk(request, data, len, index)) {
+                otaInitialized = false;
+                return;
+            }
+        }
+        
+        // Final chunk - complete the update
+        if (final && otaInitialized) {
+            _finalizeOtaUpload(request);
+            otaInitialized = false;
+        }
+    }
+
+    static bool _initializeOtaUpload(AsyncWebServerRequest *request, const String& filename)
+    {
+        LOG_INFO("Starting OTA update with file: %s", filename.c_str());
+        
+        // Validate file extension
+        if (!filename.endsWith(".bin")) {
+            LOG_ERROR("Invalid file type. Only .bin files are supported");
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "File must be in .bin format");
+            return false;
+        }
+        
+        // Get content length from header
+        size_t contentLength = request->header("Content-Length").toInt();
+        if (contentLength == 0) {
+            LOG_ERROR("No Content-Length header found or empty file");
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing Content-Length header or empty file");
+            return false;
+        }
+        
+        // Validate minimum firmware size
+        if (contentLength < MINIMUM_FIRMWARE_SIZE) {
+            LOG_ERROR("Firmware file too small: %zu bytes (minimum: %d bytes)", contentLength, MINIMUM_FIRMWARE_SIZE);
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Firmware file too small");
+            return false;
+        }
+        
+        // Check free heap
+        size_t freeHeap = ESP.getFreeHeap();
+        LOG_DEBUG("Free heap before OTA: %zu bytes", freeHeap);
+        if (freeHeap < MINIMUM_FREE_HEAP_OTA) {
+            LOG_ERROR("Insufficient memory for OTA update");
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Insufficient memory for update");
+            return false;
+        }
+        
+        // Start OTA timeout watchdog task before beginning the actual OTA process
+        _startOtaTimeoutTask();
+
+        // Begin OTA update with known size
+        if (!Update.begin(contentLength, U_FLASH)) {
+            LOG_ERROR("Failed to begin OTA update: %s", Update.errorString());
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Failed to begin update");
+            Led::doubleBlinkYellow(Led::PRIO_URGENT, 1000ULL);
+            _stopOtaTimeoutTask(); // Stop timeout task on failure
+            return false;
+        }
+        
+        // Handle MD5 verification if provided
+        _setupOtaMd5Verification(request);
+        
+        // Start LED indication for OTA progress
+        Led::blinkPurpleFast(Led::PRIO_MEDIUM);
+        
+        LOG_DEBUG("OTA update started, expected size: %zu bytes", contentLength);
+        return true;
+    }
+
+    static void _setupOtaMd5Verification(AsyncWebServerRequest *request)
+    {
+        if (!request->hasHeader("X-MD5")) {
+            LOG_WARNING("No MD5 header provided, skipping verification");
+            return;
+        }
+        
+        const char* md5HeaderCStr = request->header("X-MD5").c_str();
+        size_t headerLength = strlen(md5HeaderCStr);
+        
+        if (headerLength == MD5_BUFFER_SIZE - 1) {
+            char md5Header[MD5_BUFFER_SIZE];
+            snprintf(md5Header, sizeof(md5Header), "%s", md5HeaderCStr);
+
+            // Convert to lowercase
+            for (size_t i = 0; md5Header[i]; i++) {
+                md5Header[i] = (char)tolower((unsigned char)md5Header[i]);
+            }
+            
+            Update.setMD5(md5Header);
+            LOG_DEBUG("MD5 verification enabled: %s", md5Header);
+        } else if (headerLength > 0) {
+            LOG_WARNING("Invalid MD5 length (%zu), skipping verification", headerLength);
+        } else {
+            LOG_WARNING("No MD5 header provided, skipping verification");
+        }
+    }
+
+    static bool _writeOtaChunk(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index)
+    {
+        // Reset watchdog before flash write
+        size_t written = Update.write(data, len);
+
+        if (written != len) {
+            LOG_ERROR("OTA write failed: expected %zu bytes, wrote %zu bytes", len, written);
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Write failed");
+            Update.abort();
+            _stopOtaTimeoutTask(); // Stop timeout task on write failure
+            return false;
+        }
+
+        // Log progress periodically
+        static size_t lastProgressIndex = 0;
+        if (index >= lastProgressIndex + SIZE_REPORT_UPDATE_OTA || index == 0) {
+            esp_task_wdt_reset(); // Only do it once in a while
+            float progress = Update.size() > 0UL ? (float)Update.progress() / (float)Update.size() * 100.0f : 0.0f;
+            LOG_DEBUG("OTA progress: %.1f%% (%zu / %zu bytes)", progress, Update.progress(), Update.size());
+            lastProgressIndex = index;
+        }
+
+        return true;
+    }
+
+    static void _finalizeOtaUpload(AsyncWebServerRequest *request)
+    {
+        LOG_DEBUG("Finalizing OTA update...");
+
+        // Validate that we actually received data
+        if (Update.progress() == 0) {
+            LOG_ERROR("OTA finalization failed: No data received");
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "No firmware data received");
+            Update.abort();
+            _stopOtaTimeoutTask(); // Stop timeout task on failure
+            return;
+        }
+
+        // Validate minimum size
+        if (Update.progress() < MINIMUM_FIRMWARE_SIZE) {
+            LOG_ERROR("OTA finalization failed: Firmware too small (%zu bytes)", Update.progress());
+            _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Firmware file too small");
+            Update.abort();
+            _stopOtaTimeoutTask(); // Stop timeout task on failure
+            return;
+        }
+
+        // Reset watchdog before flash verification and finalization
+        bool success = Update.end(true);
+
+        if (!success) {
+            LOG_ERROR("OTA finalization failed: %s", Update.errorString());
+            _stopOtaTimeoutTask(); // Stop timeout task on failure
+            // Error response will be handled in the main handler
+        } else {
+            LOG_DEBUG("OTA update finalization successful");
+            Led::blinkGreenFast(Led::PRIO_CRITICAL, 3000ULL);
+            // Note: timeout task will be stopped in _handleOtaUploadComplete
+        }
+    }
+
+    static void _handleFileUploadData(AsyncWebServerRequest *request, const String& filename, 
+                                    size_t index, uint8_t *data, size_t len, bool final)
+    {
+        static File uploadFile;
+        static String targetPath;
+        
+        if (!index) {
+            // First chunk - extract path from URL and create file
+            String url = request->url();
+            targetPath = url.substring(url.indexOf("/api/v1/files/") + 14); // Remove "/api/v1/files/" prefix
+            
+            if (targetPath.length() == 0) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "File path cannot be empty");
+                return;
+            }
+            
+            // URL decode the filename to handle encoded slashes properly
+            targetPath.replace("%2F", "/");
+            targetPath.replace("%2f", "/");
+            
+            // Ensure filename starts with "/"
+            if (!targetPath.startsWith("/")) {
+                targetPath = "/" + targetPath;
+            }
+            
+            LOG_DEBUG("Starting file upload to: %s", targetPath.c_str());
+            
+            // Check available space
+            size_t freeSpace = LittleFS.totalBytes() - LittleFS.usedBytes();
+            if (freeSpace < MINIMUM_FREE_LITTLEFS_SIZE) { // Require at least 1KB free space
+                LOG_WARNING("Insufficient storage space for file upload: %zu bytes free", freeSpace);
+                _sendErrorResponse(request, HTTP_CODE_INSUFFICIENT_STORAGE, "Insufficient storage space");
+                return;
+            }
+            
+            // Create file for writing
+            uploadFile = LittleFS.open(targetPath, FILE_WRITE);
+            if (!uploadFile) {
+                LOG_ERROR("Failed to create file for upload: %s", targetPath.c_str());
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to create file");
+                return;
+            }
+        }
+        
+        // Write data chunk
+        if (len && uploadFile) {
+            size_t written = uploadFile.write(data, len);
+
+            if (written != len) {
+                LOG_ERROR("Failed to write data chunk at index %zu", index);
+                uploadFile.close();
+                LittleFS.remove(targetPath); // Clean up partial file
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to write file data");
+                return;
+            }
+        }
+        
+        // Final chunk - complete the upload
+        if (final) {
+            if (uploadFile) {
+                uploadFile.close();
+                LOG_INFO("File upload completed successfully: %s (%zu bytes)", targetPath.c_str(), index + len);
+                _sendSuccessResponse(request, "File uploaded successfully");
+            } else {
+                LOG_ERROR("File upload failed: file handle not available");
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "File upload failed");
+            }
+        }
+    }
+
+    static void _serveOtaStatusEndpoint()
+    {
+        server.on("/api/v1/ota/status", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            doc["status"] = Update.isRunning() ? "running" : "idle";
+            doc["canRollback"] = Update.canRollBack();
+            
+            const esp_partition_t *running = esp_ota_get_running_partition();
+            doc["currentPartition"] = running->label;
+            doc["hasError"] = Update.hasError();
+            doc["lastError"] = Update.errorString();
+            doc["size"] = Update.size();
+            doc["progress"] = Update.progress();
+            doc["remaining"] = Update.remaining();
+            doc["progressPercent"] = Update.size() > 0 ? (float)Update.progress() / (float)Update.size() * 100.0 : 0.0;
+            
+            // Add current firmware info
+            doc["currentVersion"] = FIRMWARE_BUILD_VERSION;
+            doc["currentMD5"] = ESP.getSketchMD5();
+            
+            _sendJsonResponse(request, doc);
+        });
+    }
+
+    static void _serveOtaRollbackEndpoint()
+    {
+        server.on("/api/v1/ota/rollback", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (Update.isRunning()) {
+                Update.abort();
+                LOG_INFO("Aborted running OTA update");
+                _stopOtaTimeoutTask(); // Stop timeout task when aborting OTA
+            }
+
+            if (Update.canRollBack()) {
+                LOG_WARNING("Firmware rollback requested via API");
+                _sendSuccessResponse(request, "Rollback initiated. Device will restart.");
+                
+                Update.rollBack();
+                setRestartSystem("Firmware rollback requested via API");
+            } else {
+                LOG_ERROR("Rollback not possible: %s", Update.errorString());
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Rollback not possible");
+            }
+        });
+    }
+
+    static bool _fetchGitHubReleaseInfo(JsonDocument &doc)
+    {
+        // Check internet connectivity before attempting API call
+        if (!CustomWifi::isFullyConnected(true)) {
+            LOG_DEBUG("Cannot fetch GitHub release info: no internet connectivity");
+            return false;
+        }
+
+        HTTPClient http;
+        http.begin(GITHUB_API_LATEST_RELEASE_URL);
+        http.addHeader("User-Agent", "EnergyMe-Home-ESP32");
+        http.addHeader("Accept", "application/vnd.github.v3+json");
+
+        // Reset watchdog before network call
+        int httpCode = http.GET();
+
+        if (httpCode != HTTP_CODE_OK) {
+            LOG_WARNING("GitHub API request failed with code: %d", httpCode);
+            http.end();
+            return false;
+        }
+
+        // Parse GitHub API response - reset before and after data fetch
+        String response = http.getString();
+        http.end();
+
+
+        // Create the JSON document for parsing the response (different from the function argument doc)
+        SpiRamAllocator allocator;
+        JsonDocument responseDoc(&allocator);
+
+        DeserializationError error = deserializeJson(responseDoc, response);
+        if (error) {
+            LOG_WARNING("Failed to parse GitHub API response: %s", error.c_str());
+            return false;
+        }
+
+        if (!responseDoc.is<JsonObject>()) {
+            LOG_WARNING("Invalid GitHub API response: expected object");
+            return false;
+        }
+
+        // /releases/latest returns the newest published release repo-wide and already
+        // excludes drafts and prereleases, so no filtering loop is needed here.
+        JsonObject release = responseDoc.as<JsonObject>();
+
+        const char* tagName = release["tag_name"].as<const char*>();
+        if (!tagName) {
+            LOG_WARNING("No tag_name in GitHub latest release response");
+            return false;
+        }
+
+        const char* releaseDate = release["published_at"].as<const char*>();
+        const char* changelog = release["html_url"].as<const char*>();
+        const char* downloadUrl = nullptr;
+
+        for (JsonObject asset : release["assets"].as<JsonArray>()) {
+            const char* name = asset["name"].as<const char*>();
+            if (name && strstr(name, ".bin") != nullptr && strstr(name, "energyme_home") != nullptr) {
+                downloadUrl = asset["browser_download_url"].as<const char*>();
+                break;
+            }
+        }
+
+        // Compare versions to determine if update is available
+        bool isLatest = _compareVersions(FIRMWARE_BUILD_VERSION, tagName) >= 0;
+        doc["isLatest"] = isLatest;
+
+        // Only populate update fields when a newer version is available
+        if (!isLatest) {
+            doc["availableVersion"] = tagName;
+            if (releaseDate) doc["releaseDate"] = releaseDate;
+            if (downloadUrl) doc["updateUrl"] = downloadUrl;
+            if (changelog) doc["changelogUrl"] = changelog;
+        }
+
+        LOG_DEBUG("GitHub release info fetched: version=%s, isLatest=%s",
+                 tagName, isLatest ? "true" : "false");
+
+        return true;
+    }
+
+    static int _compareVersions(const char* current, const char* available)
+    {
+        // Parse version strings (assuming semantic versioning: x.y.z)
+        int currentMajor = 0, currentMinor = 0, currentPatch = 0;
+        int availableMajor = 0, availableMinor = 0, availablePatch = 0;
+        
+        // Remove 'v' prefix if present
+        const char* currentStr = (current[0] == 'v') ? current + 1 : current;
+        const char* availableStr = (available[0] == 'v') ? available + 1 : available;
+        
+        sscanf(currentStr, "%d.%d.%d", &currentMajor, &currentMinor, &currentPatch);
+        sscanf(availableStr, "%d.%d.%d", &availableMajor, &availableMinor, &availablePatch);
+        
+        // Compare versions
+        if (currentMajor != availableMajor) return currentMajor - availableMajor;
+        if (currentMinor != availableMinor) return currentMinor - availableMinor;
+        return currentPatch - availablePatch;
+    }
+
+    static void _serveFirmwareStatusEndpoint()
+    {
+        // Get firmware update information
+        server.on("/api/v1/firmware/update-info", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            // Get current firmware info
+            doc["currentVersion"] = FIRMWARE_BUILD_VERSION;
+            doc["buildDate"] = FIRMWARE_BUILD_DATE;
+
+            // In non-community mode, we assume updates are handled via app/cloud, so we consider it always up to date            
+            if (!globalCommunityMode) doc["isLatest"] = true; 
+            else if (CustomWifi::isFullyConnected(true)) { // Check internet connectivity before checking anything            
+                // Fetch from GitHub API in community mode
+                bool githubInfoFetched = _fetchGitHubReleaseInfo(doc);
+                
+                if (!githubInfoFetched) {
+                    doc["isLatest"] = true; // Assume latest since we can't check
+                    // Here we log the warning since internet should be present, but most likely GitHub/the logic broke
+                    LOG_WARNING("Failed to fetch GitHub release info, assuming current version is latest");
+                }
+            } else {
+                doc["isLatest"] = true; // Assume latest since we can't check
+                LOG_DEBUG("No internet connectivity, cannot check for firmware updates"); // Only debug since internet may not be available
+            }
+
+            _sendJsonResponse(request, doc);
+        });
+    }
+
+    // === SYSTEM MANAGEMENT ENDPOINTS ===
+    static void _serveSystemEndpoints()
+    {
+        // System information
+        server.on("/api/v1/system/info", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            // Get both static and dynamic info
+            SpiRamAllocator allocatorStatic, allocatorDynamic;
+            JsonDocument docStatic(&allocatorStatic);
+            JsonDocument docDynamic(&allocatorDynamic);
+            getJsonDeviceStaticInfo(docStatic);
+            getJsonDeviceDynamicInfo(docDynamic);
+
+            // Combine into a single response
+            doc["static"] = docStatic;
+            doc["dynamic"] = docDynamic;
+            
+            _sendJsonResponse(request, doc); });
+
+        // Statistics
+        server.on("/api/v1/system/statistics", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            statisticsToJson(statistics, doc);
+            _sendJsonResponse(request, doc); });
+
+        // Raw CPU ring samples - forensic timeline endpoint
+        // Query params: lastSeconds (1..3600, default 600), core (0|1|both, default both)
+        server.on("/api/v1/system/cpu/samples", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            uint32_t lastSeconds = TaskProfiler::CPU_DEFAULT_FETCH_LAST_SECONDS;
+            if (request->hasParam("lastSeconds")) {
+                long parsed = request->getParam("lastSeconds")->value().toInt();
+                if (parsed <= 0) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "lastSeconds must be a positive integer");
+                    return;
+                }
+                lastSeconds = (uint32_t)parsed;
+                if (lastSeconds > TaskProfiler::CPU_RING_CAPACITY_SECONDS)
+                    lastSeconds = TaskProfiler::CPU_RING_CAPACITY_SECONDS;
+            }
+
+            bool wantCore0 = true, wantCore1 = true;
+            if (request->hasParam("core")) {
+                const String& coreParam = request->getParam("core")->value();
+                if (coreParam == "0")         { wantCore1 = false; }
+                else if (coreParam == "1")    { wantCore0 = false; }
+                else if (coreParam != "both") {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "core must be 0, 1, or both");
+                    return;
+                }
+            }
+
+            // Allocate temp buffer on heap (max 3600 entries x 8 B = 28.8 KB).
+            // ESPAsyncWebServer dispatches handlers serially so the buffer never
+            // overlaps with another invocation of this handler.
+            size_t maxSamples = lastSeconds > 0 ? lastSeconds : TaskProfiler::CPU_RING_CAPACITY_SECONDS;
+            TaskProfiler::CpuSample* buf = (TaskProfiler::CpuSample*)ps_malloc(maxSamples * sizeof(TaskProfiler::CpuSample));
+            if (buf == nullptr) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Out of PSRAM");
+                return;
+            }
+
+            size_t count = TaskProfiler::getRawSamples(buf, maxSamples, lastSeconds);
+
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            doc["intervalSeconds"] = 1;
+            doc["fromEpoch"] = count > 0 ? buf[0].epochSecond : 0;
+            doc["toEpoch"]   = count > 0 ? buf[count - 1].epochSecond : 0;
+            doc["samplesReturned"] = count;
+
+            if (wantCore0) {
+                JsonArray a0 = doc["core0"].to<JsonArray>();
+                for (size_t i = 0; i < count; i++) a0.add(buf[i].core0Percent);
+            }
+            if (wantCore1) {
+                JsonArray a1 = doc["core1"].to<JsonArray>();
+                for (size_t i = 0; i < count; i++) a1.add(buf[i].core1Percent);
+            }
+
+            free(buf);
+            _sendJsonResponse(request, doc); });
+
+        // System restart
+        server.on("/api/v1/system/restart", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            if (setRestartSystem("System restart requested via API")) {
+                _sendSuccessResponse(request, "System restart initiated");
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_LOCKED, "Failed to initiate restart. Another restart may already be in progress or restart is currently locked");
+            } });
+
+        // Factory reset
+        server.on("/api/v1/system/factory-reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            _sendSuccessResponse(request, "Factory reset initiated");
+            setRestartSystem("Factory reset requested via API", true); });
+
+        // Safe mode info
+        server.on("/api/v1/system/safe-mode", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["active"] = CrashMonitor::isInSafeMode();
+            doc["canRestartNow"] = CrashMonitor::canRestartNow();
+            doc["minimumUptimeRemainingMs"] = CrashMonitor::getMinimumUptimeRemaining();
+            if (CrashMonitor::isInSafeMode()) {
+                doc["message"] = "Device in safe mode - restart protection active to prevent loops";
+                doc["action"] = "Wait for minimum uptime or perform OTA update to fix underlying issue";
+            }
+
+            _sendJsonResponse(request, doc); });
+
+        // Clear safe mode
+        server.on("/api/v1/system/safe-mode/clear", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            if (CrashMonitor::isInSafeMode()) {
+                CrashMonitor::clearSafeModeCounters();
+                _sendSuccessResponse(request, "Safe mode cleared. Device will restart.");
+                setRestartSystem("Safe mode manually cleared via API");
+            } else {
+                _sendSuccessResponse(request, "Device is not in safe mode");
+            } });
+
+        // Check if secrets exist
+        server.on("/api/v1/system/secrets", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["hasSecrets"] = !globalCommunityMode;
+            _sendJsonResponse(request, doc); });
+
+        // Get system time
+        server.on("/api/v1/system/time", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["synced"] = CustomTime::isTimeSynched();
+            doc["unixTime"] = CustomTime::getUnixTime();
+
+            char isoBuffer[TIMESTAMP_BUFFER_SIZE];
+            CustomTime::getTimestampIso(isoBuffer, sizeof(isoBuffer));
+            doc["isoTime"] = isoBuffer;
+
+            _sendJsonResponse(request, doc); });
+
+        // Set system time (for devices without internet connectivity)
+        server.on(
+            "/api/v1/system/time",
+            HTTP_POST,
+            [](AsyncWebServerRequest *request) {},
+            NULL,
+            [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
+            {
+                if (!_validateRequest(request, "POST")) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                DeserializationError error = deserializeJson(doc, data, len);
+
+                if (error || !doc["unixTime"].is<uint64_t>())
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid JSON. Required: {\"unixTime\": <unix_seconds>}");
+                    return;
+                }
+
+                uint64_t unixTime = doc["unixTime"].as<uint64_t>();
+                if (CustomTime::setUnixTime(unixTime))
+                {
+                    SpiRamAllocator respAllocator;
+                    JsonDocument respDoc(&respAllocator);
+                    respDoc["success"] = true;
+                    respDoc["message"] = "Time synchronized";
+
+                    char isoBuffer[TIMESTAMP_BUFFER_SIZE];
+                    CustomTime::getTimestampIso(isoBuffer, sizeof(isoBuffer));
+                    respDoc["newTime"] = isoBuffer;
+
+                    _sendJsonResponse(request, respDoc);
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Failed to set time. Value out of valid range.");
+                }
+            });
+    }
+
+    // === NETWORK MANAGEMENT ENDPOINTS ===
+    // === ISSUE REGISTRY ENDPOINTS ===
+    static void _serveIssueEndpoints()
+    {
+        // Currently visible device issues (issue #145)
+        server.on("/api/v1/system/issues", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            if (!IssueRegistry::issuesToJson(doc)) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve issues");
+                return;
+            }
+            _sendJsonResponse(request, doc); });
+
+        // Acknowledge issues: {"all": true} or {"code": "...", "channel": <optional>}
+        static AsyncCallbackJsonWebHandler *ackIssueHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/system/issues/ack",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "POST", HTTP_MAX_CONTENT_LENGTH_ISSUES_ACK)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (doc["all"].is<bool>() && doc["all"].as<bool>()) {
+                    uint32_t ackedCount = IssueRegistry::ackAll();
+                    char message[STATUS_BUFFER_SIZE];
+                    snprintf(message, sizeof(message), "Acknowledged %lu issue(s)", (unsigned long)ackedCount);
+                    _sendSuccessResponse(request, message);
+                    return;
+                }
+
+                if (!doc["code"].is<const char*>()) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing 'code' (or 'all') parameter");
+                    return;
+                }
+
+                uint8_t channel = ISSUE_GLOBAL_SCOPE;
+                if (doc["channel"].is<uint8_t>()) channel = doc["channel"].as<uint8_t>();
+
+                if (IssueRegistry::ack(doc["code"].as<const char*>(), channel)) {
+                    _sendSuccessResponse(request, "Issue acknowledged");
+                } else {
+                    _sendErrorResponse(request, HTTP_CODE_NOT_FOUND, "No such issue instance");
+                } });
+        server.addHandler(ackIssueHandler);
+    }
+
+    static void _serveNetworkEndpoints()
+    {
+        // WiFi reset
+        server.on("/api/v1/network/wifi/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            _sendSuccessResponse(request, "WiFi credentials reset. Device will restart and enter configuration mode.");
+            CustomWifi::resetWifi(); 
+        });
+
+        // Set WiFi credentials
+        AsyncCallbackJsonWebHandler *wifiCredentialsHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/network/wifi/credentials",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "POST")) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                // Validate required fields
+                if (!doc["ssid"].is<const char*>())
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing or invalid 'ssid' field");
+                    return;
+                }
+
+                if (!doc["password"].is<const char*>())
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing 'password' field");
+                    return;
+                }
+
+                const char* ssid = doc["ssid"];
+                const char* password = doc["password"];
+
+                // Validate SSID length (1-31 characters)
+                if (!isStringLengthValid(ssid, 1, WIFI_SSID_BUFFER_SIZE - 1))
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "SSID must be 1-31 characters");
+                    return;
+                }
+
+                // Validate password length (0-63 characters)
+                if (!isStringLengthValid(password, 0, WIFI_PASSWORD_BUFFER_SIZE - 1))
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Password must be 0-63 characters");
+                    return;
+                }
+
+                LOG_INFO("Received request to set WiFi credentials for SSID: %s", ssid);
+
+                if (CustomWifi::setCredentials(ssid, password)) _sendSuccessResponse(request, "WiFi credentials updated successfully. It will restart and attempt to connect to the new network.");
+                else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to save credentials for the specified network. Please verify them and try again.");
+            });
+        server.addHandler(wifiCredentialsHandler);
+
+        // Get network configuration (static IP)
+        server.on("/api/v1/network/config", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            if (CustomWifi::getConfigurationAsJson(doc)) _sendJsonResponse(request, doc);
+            else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to get network configuration");
+        });
+
+        // Set network configuration (full PUT or partial PATCH). The device restarts to apply.
+        static AsyncCallbackJsonWebHandler *setNetworkConfigHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/network/config",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                bool isPartialUpdate = _isPartialUpdate(request);
+                if (!_validateRequest(request, isPartialUpdate ? "PATCH" : "PUT", HTTP_MAX_CONTENT_LENGTH_NETWORK)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (CustomWifi::setConfigurationFromJson(doc, isPartialUpdate)) {
+                    LOG_INFO("Network configuration %s via API", isPartialUpdate ? "partially updated" : "updated");
+                    _sendSuccessResponse(request, "Network configuration updated successfully. The device will restart to apply the new settings.");
+                    setRestartSystem("Restart to apply new network configuration");
+                } else {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid network configuration");
+                }
+            });
+        server.addHandler(setNetworkConfigHandler);
+
+        // Reset network configuration to defaults (DHCP)
+        server.on("/api/v1/network/config/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            if (CustomWifi::resetConfiguration()) {
+                _sendSuccessResponse(request, "Network configuration reset successfully. The device will restart to apply the defaults.");
+                setRestartSystem("Restart to apply network configuration reset");
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to reset network configuration");
+            }
+        });
+    }
+
+    // === LOGGING ENDPOINTS ===
+    static void _serveLoggingEndpoints()
+    {
+        // Get log levels
+        server.on("/api/v1/logs/level", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["print"] = AdvancedLogger::logLevelToString(AdvancedLogger::getPrintLevel());
+            doc["save"] = AdvancedLogger::logLevelToString(AdvancedLogger::getSaveLevel());
+            _sendJsonResponse(request, doc);
+        });
+
+        // Set log levels (using AsyncCallbackJsonWebHandler for JSON body)
+        static AsyncCallbackJsonWebHandler *setLogLevelHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/logs/level",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                bool isPartialUpdate = _isPartialUpdate(request);
+                if (!_validateRequest(request, isPartialUpdate ? "PATCH" : "PUT", HTTP_MAX_CONTENT_LENGTH_LOGS_LEVEL)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                const char *printLevel = doc["print"].as<const char *>();
+                const char *saveLevel = doc["save"].as<const char *>();
+
+                if (!printLevel && !saveLevel)
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "At least one of 'print' or 'save' level must be specified");
+                    return;
+                }
+
+                char resultMsg[STATUS_BUFFER_SIZE];
+                snprintf(resultMsg, sizeof(resultMsg), "Log levels %s:", isPartialUpdate ? "partially updated" : "updated");
+                bool success = true;
+
+                // Set print level if provided
+                if (printLevel && success)
+                {
+                    LogLevel level;
+                    if (_parseLogLevel(printLevel, level))
+                    {
+                        AdvancedLogger::setPrintLevel(level);
+                        snprintf(resultMsg + strlen(resultMsg), sizeof(resultMsg) - strlen(resultMsg),
+                                 " print=%s", printLevel);
+                    }
+                    else
+                    {
+                        success = false;
+                    }
+                }
+
+                // Set save level if provided
+                if (saveLevel && success)
+                {
+                    LogLevel level;
+                    if (_parseLogLevel(saveLevel, level))
+                    {
+                        AdvancedLogger::setSaveLevel(level);
+                        snprintf(resultMsg + strlen(resultMsg), sizeof(resultMsg) - strlen(resultMsg),
+                                 " save=%s", saveLevel);
+                    }
+                    else
+                    {
+                        success = false;
+                    }
+                }
+
+                if (success)
+                {
+                    _sendSuccessResponse(request, resultMsg);
+                    LOG_INFO("Log levels %s via API", isPartialUpdate ? "partially updated" : "updated");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid log level specified. Valid levels: VERBOSE, DEBUG, INFO, WARNING, ERROR, FATAL");
+                }
+            });
+        server.addHandler(setLogLevelHandler);
+
+        // Get all logs
+        server.on("/api/v1/logs", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            request->send(LittleFS, LOG_PATH, "text/plain");
+        });
+
+        // Clear logs
+        server.on("/api/v1/logs/clear", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            AdvancedLogger::clearLog();
+            _sendSuccessResponse(request, "Logs cleared successfully");
+            LOG_INFO("Logs cleared via API");
+        });
+
+        // Get UDP log destination (cannot use logs/ as it interferes with the previous /logs endpoint)
+        server.on("/api/v1/logs-udp-destination", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            char ipAddress[IP_ADDRESS_BUFFER_SIZE];
+            
+            if (CustomLog::getUdpDestination(ipAddress, sizeof(ipAddress))) {
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc["destination"] = ipAddress;
+                _sendJsonResponse(request, doc);
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve UDP destination");
+            }
+        });
+
+        // Set UDP log destination
+        static AsyncCallbackJsonWebHandler *setUdpDestinationHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/logs-udp-destination",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_UDP_DESTINATIONS)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                const char* destination = doc["destination"].as<const char*>();
+                if (!destination) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing 'destination' field");
+                    return;
+                }
+
+                if (CustomLog::setUdpDestination(destination)) {
+                    _sendSuccessResponse(request, "UDP destination updated successfully");
+                    LOG_INFO("UDP destination updated via API: %s", destination);
+                } else {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid IP address format");
+                }
+            });
+        server.addHandler(setUdpDestinationHandler);
+    }
+
+    // === ADE7953 ENDPOINTS ===
+    static void _serveAde7953Endpoints() {
+        // === CONFIGURATION ENDPOINTS ===
+        
+        // Get ADE7953 configuration
+        server.on("/api/v1/ade7953/config", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            Ade7953::getConfigurationAsJson(doc);
+            
+            _sendJsonResponse(request, doc);
+        });
+
+        // Set ADE7953 configuration (PUT/PATCH)
+        static AsyncCallbackJsonWebHandler *setAde7953ConfigHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/config",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                bool isPartialUpdate = _isPartialUpdate(request);
+                if (!_validateRequest(request, isPartialUpdate ? "PATCH" : "PUT", HTTP_MAX_CONTENT_LENGTH_ADE7953_CONFIG)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (Ade7953::setConfigurationFromJson(doc, isPartialUpdate))
+                {
+                    LOG_INFO("ADE7953 configuration %s via API", isPartialUpdate ? "partially updated" : "updated");
+                    _sendSuccessResponse(request, "ADE7953 configuration updated successfully");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid ADE7953 configuration");
+                }
+            });
+        server.addHandler(setAde7953ConfigHandler);
+
+        // Reset ADE7953 configuration
+        server.on("/api/v1/ade7953/config/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            Ade7953::resetConfiguration();
+            _sendSuccessResponse(request, "ADE7953 configuration reset successfully");
+        });
+
+        // === SAMPLE TIME ENDPOINTS ===
+        
+        // Get sample time
+        server.on("/api/v1/ade7953/sample-time", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["sampleTime"] = Ade7953::getSampleTime();
+            
+            _sendJsonResponse(request, doc);
+        });
+
+        // Set sample time
+        static AsyncCallbackJsonWebHandler *setSampleTimeHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/sample-time",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_ADE7953_SAMPLE_TIME)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (!doc["sampleTime"].is<uint64_t>()) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "sampleTime field must be a positive integer");
+                    return;
+                }
+
+                uint64_t sampleTime = doc["sampleTime"].as<uint64_t>();
+
+                if (Ade7953::setSampleTime(sampleTime))
+                {
+                    char sampleTimeHuman[DURATION_FORMAT_BUFFER_SIZE];
+                    DurationFormat::humanizeDuration(sampleTime, sampleTimeHuman, sizeof(sampleTimeHuman));
+                    LOG_INFO("ADE7953 sample time updated to %s via API", sampleTimeHuman);
+                    _sendSuccessResponse(request, "ADE7953 sample time updated successfully");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid sample time value");
+                }
+            });
+        server.addHandler(setSampleTimeHandler);
+
+        // === CHANNEL DATA ENDPOINTS ===
+        
+        // Get single channel data
+        server.on("/api/v1/ade7953/channel", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            if (request->hasParam("index")) {
+                // Get single channel data
+                uint8_t channelIndex = (uint8_t)(request->getParam("index")->value().toInt());
+                if (!isChannelValid(channelIndex)) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                } else {
+                    if (Ade7953::getChannelDataAsJson(doc, channelIndex)) _sendJsonResponse(request, doc);
+                    else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Error fetching single channel data");
+                }
+            } else {
+                // Get all channels data - with ETag caching
+                uint32_t configHash = Ade7953::computeAllChannelDataHash();
+                if (configHash == 0) {
+                    // Error computing hash, send data without caching
+                    if (Ade7953::getAllChannelDataAsJson(doc)) _sendJsonResponse(request, doc);
+                    else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Error fetching all channels data");
+                    return;
+                }
+
+                // Generate ETag
+                char etag[16];
+                snprintf(etag, sizeof(etag), "\"%08x\"", configHash); // It says the format is incorrect but it works in the end
+
+                // Check If-None-Match header and send 304 if matched
+                if (_checkEtagAndSend304(request, etag)) {
+                    return;
+                }
+
+                // Data has changed or no cached version, send full response with ETag
+                if (Ade7953::getAllChannelDataAsJson(doc)) {
+                    AsyncResponseStream *response = request->beginResponseStream("application/json");
+                    serializeJson(doc, *response);
+                    _sendResponseWithEtag(request, response, etag);
+                } else {
+                    _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Error fetching all channels data");
+                }
+            }
+        });
+
+        // Set single channel data (PUT/PATCH)
+        static AsyncCallbackJsonWebHandler *setChannelDataHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/channel",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                bool isPartialUpdate = _isPartialUpdate(request);
+                if (!_validateRequest(request, isPartialUpdate ? "PATCH" : "PUT", HTTP_MAX_CONTENT_LENGTH_ADE7953_CHANNEL_DATA)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                bool roleChanged = false;
+                if (Ade7953::setChannelDataFromJson(doc, isPartialUpdate, &roleChanged))
+                {
+                    uint8_t channelIndex = doc["index"].as<uint8_t>();
+                    
+                    if (!isChannelValid(channelIndex)) {
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                        return;
+                    }
+                    
+                    LOG_INFO("ADE7953 channel %u data %s via API", channelIndex, isPartialUpdate ? "partially updated" : "updated");
+                    if (roleChanged) {
+                        Ade7953::resetChannelEnergyValues(channelIndex);
+                        LOG_DEBUG("Auto-reset energy and cleared history for channel %u due to role change", channelIndex);
+                    }
+                    _sendSuccessResponse(request, "ADE7953 channel data updated successfully");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid ADE7953 channel data");
+                }
+            });
+        server.addHandler(setChannelDataHandler);
+
+        // Set all channels data (PUT only - bulk update)
+        static AsyncCallbackJsonWebHandler *setAllChannelsDataHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/channels",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_ADE7953_CHANNEL_DATA * MAX_CHANNEL_COUNT)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                // Validate that it's an array
+                if (!doc.is<JsonArrayConst>()) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Request body must be an array of channel configurations");
+                    return;
+                }
+
+                // Update all channels - let setChannelDataFromJson handle all validation
+                SpiRamAllocator channelAllocator;
+                JsonDocument channelDoc(&channelAllocator);
+                for (JsonDocument channelDoc : doc.as<JsonArrayConst>()) {
+                    bool roleChanged = false;
+                    if (!Ade7953::setChannelDataFromJson(channelDoc, false, &roleChanged)) {
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel configuration in array");
+                        return;
+                    }
+                    if (roleChanged) {
+                        uint8_t idx = channelDoc["index"].as<uint8_t>();
+                        Ade7953::resetChannelEnergyValues(idx);
+                        LOG_INFO("Auto-reset energy and cleared history for channel %u due to role change", idx);
+                    }
+                }
+
+                LOG_INFO("Bulk updated %u ADE7953 channels via API", doc.size());
+                _sendSuccessResponse(request, "All channels updated successfully");
+            });
+        server.addHandler(setAllChannelsDataHandler);
+
+        // Reset single channel data
+        server.on("/api/v1/ade7953/channel/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+            
+            if (!request->hasParam("index")) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing channel index parameter");
+                return;
+            }
+
+            uint8_t channelIndex = (uint8_t)(request->getParam("index")->value().toInt());
+            if (!isChannelValid(channelIndex)) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                return;
+            }
+            Ade7953::resetChannelData(channelIndex);
+
+            LOG_INFO("ADE7953 channel %u data reset via API", channelIndex);
+            _sendSuccessResponse(request, "ADE7953 channel data reset successfully");
+        });
+
+        // === REGISTER ENDPOINTS ===
+        
+        // Read single register
+        server.on("/api/v1/ade7953/register", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            if (!request->hasParam("address")) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing register address parameter");
+                return;
+            }
+            
+            if (!request->hasParam("bits")) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing register bits parameter");
+                return;
+            }
+
+            int32_t addressValue = request->getParam("address")->value().toInt();
+            int32_t bitsValue = request->getParam("bits")->value().toInt();
+
+            if (!isValueInRange(addressValue, 0, (int32_t)UINT16_MAX)) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Register address out of range (0-65535)");
+                return;
+            }
+            if (!isValueInRange(bitsValue, 0, (int32_t)UINT8_MAX)) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Register bits out of range (0-255)");
+                return;
+            }
+
+            uint16_t address = (uint16_t)(addressValue);
+            uint8_t bits = (uint8_t)(bitsValue);
+            bool signedData = request->hasParam("signed") ? request->getParam("signed")->value().equals("true") : false;
+
+            int32_t value = Ade7953::readRegister(address, bits, signedData);
+            
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["address"] = address;
+            doc["bits"] = bits;
+            doc["signed"] = signedData;
+            doc["value"] = value;
+            
+            _sendJsonResponse(request, doc);
+        });
+
+        // Write single register
+        static AsyncCallbackJsonWebHandler *writeRegisterHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/register",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+            if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_ADE7953_REGISTER)) return;
+
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            doc.set(json);
+
+            if (!doc["address"].is<int32_t>() || !doc["bits"].is<int32_t>() || !doc["value"].is<int32_t>()) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "address, bits, and value fields must be integers");
+                return;
+            }
+
+            int32_t addressValue = doc["address"].as<int32_t>();
+            int32_t bitsValue = doc["bits"].as<int32_t>();
+
+            if (!isValueInRange(addressValue, 0, (int32_t)UINT16_MAX)) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Register address out of range (0-65535)");
+                return;
+            }
+            if (!isValueInRange(bitsValue, 0, (int32_t)UINT8_MAX)) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Register bits out of range (0-255)");
+                return;
+            }
+
+            uint16_t address = (uint16_t)(addressValue);
+            uint8_t bits = (uint8_t)(bitsValue);
+            int32_t value = doc["value"].as<int32_t>();
+
+            Ade7953::writeRegister(address, bits, value);
+
+            LOG_INFO("ADE7953 register 0x%X (%d bits) written with value 0x%X via API", address, bits, value);
+            _sendSuccessResponse(request, "ADE7953 register written successfully");
+            });
+        server.addHandler(writeRegisterHandler);
+
+        // === METER VALUES ENDPOINTS ===
+        
+        // Get meter values (all channels or single channel with optional index parameter)
+        server.on("/api/v1/ade7953/meter-values", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            if (request->hasParam("index")) {
+                // Get single channel meter values
+                long indexValue = request->getParam("index")->value().toInt();
+                uint8_t channelIndex = (uint8_t)(indexValue);
+                if (!isChannelValid(channelIndex)) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                } else {
+                    if (Ade7953::singleMeterValuesToJson(doc, channelIndex)) _sendJsonResponse(request, doc);
+                    else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Error fetching single meter values");
+                }
+            } else {
+                // Get all meter values
+                if (Ade7953::fullMeterValuesToJson(doc)) _sendJsonResponse(request, doc);
+                else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Error fetching all meter values");
+            }
+        });
+
+        // === GRID FREQUENCY ENDPOINT ===
+        
+        // Get grid frequency
+        server.on("/api/v1/ade7953/grid-frequency", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            doc["gridFrequency"] = Ade7953::getGridFrequency();
+            
+            _sendJsonResponse(request, doc);
+        });
+
+        // === ENERGY VALUES ENDPOINTS ===
+
+        // Reset energy values (all channels, or single channel with ?index=N)
+        server.on("/api/v1/ade7953/energy/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            if (request->hasParam("index")) {
+                uint8_t channelIndex = static_cast<uint8_t>(request->getParam("index")->value().toInt());
+                if (!isChannelValid(channelIndex)) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                    return;
+                }
+                Ade7953::resetChannelEnergyValues(channelIndex);
+                LOG_INFO("ADE7953 energy values reset for channel %u via API", channelIndex);
+                _sendSuccessResponse(request, "ADE7953 energy values reset for channel");
+            } else {
+                Ade7953::resetEnergyValues();
+                LOG_INFO("ADE7953 energy values reset via API");
+                _sendSuccessResponse(request, "ADE7953 energy values reset successfully");
+            }
+        });
+
+        // Set energy values for a specific channel
+        static AsyncCallbackJsonWebHandler *setEnergyValuesHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/energy",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_ADE7953_ENERGY)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (!doc["channel"].is<uint8_t>()) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "channel field must be a positive integer");
+                    return;
+                }
+
+                uint8_t channel = doc["channel"].as<uint8_t>();
+
+                if (!isChannelValid(channel)) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                    return;
+                }
+
+                if (!doc["activeEnergyImported"].is<double>() ||
+                    !doc["activeEnergyExported"].is<double>() ||
+                    !doc["reactiveEnergyImported"].is<double>() ||
+                    !doc["reactiveEnergyExported"].is<double>() ||
+                    !doc["apparentEnergy"].is<double>()) 
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "All energy value fields must be present and of type double");
+                    return;
+                }
+
+                double activeEnergyImported = doc["activeEnergyImported"].as<double>();
+                double activeEnergyExported = doc["activeEnergyExported"].as<double>();
+                double reactiveEnergyImported = doc["reactiveEnergyImported"].as<double>();
+                double reactiveEnergyExported = doc["reactiveEnergyExported"].as<double>();
+                double apparentEnergy = doc["apparentEnergy"].as<double>();
+
+                if (Ade7953::setEnergyValues(channel, activeEnergyImported, activeEnergyExported, 
+                                           reactiveEnergyImported, reactiveEnergyExported, apparentEnergy))
+                {
+                    LOG_INFO("ADE7953 energy values set for channel %lu via API", channel);
+                    _sendSuccessResponse(request, "ADE7953 energy values updated successfully");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid energy values or channel");
+                }
+            });
+        server.addHandler(setEnergyValuesHandler);
+    }
+    
+    // === CUSTOM MQTT ENDPOINTS ===
+    static void _serveCustomMqttEndpoints()
+    {
+        server.on("/api/v1/custom-mqtt/config", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {            
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            if (CustomMqtt::getConfigurationAsJson(doc)) _sendJsonResponse(request, doc);
+            else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to get Custom MQTT configuration");
+        });
+
+        static AsyncCallbackJsonWebHandler *setCustomMqttHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/custom-mqtt/config",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {                
+                bool isPartialUpdate = _isPartialUpdate(request);
+                if (!_validateRequest(request, isPartialUpdate ? "PATCH" : "PUT", HTTP_MAX_CONTENT_LENGTH_CUSTOM_MQTT)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (CustomMqtt::setConfigurationFromJson(doc, isPartialUpdate))
+                {
+                    LOG_INFO("Custom MQTT configuration %s via API", isPartialUpdate ? "partially updated" : "updated");
+                    _sendSuccessResponse(request, "Custom MQTT configuration updated successfully");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid Custom MQTT configuration");
+                }
+            });
+        server.addHandler(setCustomMqttHandler);
+
+        // Reset configuration
+        server.on("/api/v1/custom-mqtt/config/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            CustomMqtt::resetConfiguration();
+            _sendSuccessResponse(request, "Custom MQTT configuration reset successfully");
+        });
+
+        server.on("/api/v1/custom-mqtt/status", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            // Add runtime status information
+            char statusBuffer[STATUS_BUFFER_SIZE];
+            char timestampBuffer[TIMESTAMP_BUFFER_SIZE];
+            CustomMqtt::getRuntimeStatus(statusBuffer, sizeof(statusBuffer), timestampBuffer, sizeof(timestampBuffer));
+            doc["status"] = statusBuffer;
+            doc["statusTimestamp"] = timestampBuffer;
+            
+            _sendJsonResponse(request, doc);
+        });
+
+        // === WAVEFORM CAPTURE ENDPOINTS ===
+        
+        // Arm waveform capture for a channel
+        static AsyncCallbackJsonWebHandler *armWaveformCaptureHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/ade7953/waveform/arm",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+            if (!_validateRequest(request, "POST", HTTP_MAX_CONTENT_LENGTH_ADE7953_WAVEFORM_ARM)) return;
+
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            doc.set(json);
+
+            if (!doc["channelIndex"].is<uint8_t>()) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing or invalid channelIndex");
+                return;
+            }
+
+            uint8_t channelIndex = doc["channelIndex"].as<uint8_t>();
+
+            if (!isChannelValid(channelIndex)) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid channel index");
+                return;
+            }
+
+            Ade7953::startWaveformCapture(channelIndex);
+            
+            Ade7953::CaptureState state = Ade7953::getWaveformCaptureStatus();
+            switch (state) {
+                case Ade7953::CaptureState::IDLE:
+                    _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to arm waveform capture due to unknown error");
+                    break;
+                case Ade7953::CaptureState::ARMED:
+                    LOG_DEBUG("Waveform capture armed via API for channel %u", channelIndex);
+                    _sendSuccessResponse(request, "Waveform capture armed successfully");
+                    break;
+                case Ade7953::CaptureState::CAPTURING:
+                    _sendErrorResponse(request, HTTP_CODE_CONFLICT, "Waveform capture already in progress");
+                    break;
+                case Ade7953::CaptureState::COMPLETE:
+                    _sendErrorResponse(request, HTTP_CODE_CONFLICT, "Previous waveform capture complete. Please retrieve data before arming a new capture");
+                    break;
+                case Ade7953::CaptureState::ERROR:
+                    _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Waveform capture buffer allocation failed");
+                    break;
+                default:
+                    _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to arm waveform capture due to unknown error");
+                    break;
+            }
+            return;
+        });
+        server.addHandler(armWaveformCaptureHandler);
+
+        // Get waveform capture status
+        server.on("/api/v1/ade7953/waveform/status", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            Ade7953::CaptureState state = Ade7953::getWaveformCaptureStatus();
+            
+            switch (state) {
+                case Ade7953::CaptureState::IDLE:
+                    doc["state"] = "idle";
+                    break;
+                case Ade7953::CaptureState::ARMED:
+                    doc["state"] = "armed";
+                    break;
+                case Ade7953::CaptureState::CAPTURING:
+                    doc["state"] = "capturing";
+                    break;
+                case Ade7953::CaptureState::COMPLETE:
+                    doc["state"] = "complete";
+                    break;
+                case Ade7953::CaptureState::ERROR:
+                    doc["state"] = "error";
+                    break;
+            }
+            doc["channel"] = Ade7953::getWaveformCaptureChannel();
+
+            LOG_DEBUG("Waveform capture status retrieved via API. Status for channel %u: %s",
+                      doc["channel"].as<uint8_t>(),
+                      doc["state"].as<const char *>());
+            _sendJsonResponse(request, doc);
+        });
+
+        // Get waveform capture data
+        server.on("/api/v1/ade7953/waveform/data", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            Ade7953::CaptureState state = Ade7953::getWaveformCaptureStatus();
+            
+            if (state != Ade7953::CaptureState::COMPLETE) {
+                JsonDocument doc;
+                doc["message"] = "Waveform capture data not available";
+                _sendJsonResponse(request, doc, HTTP_CODE_NO_CONTENT);
+                return;
+            }
+
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+
+            bool success = Ade7953::getWaveformCaptureAsJson(doc);
+            
+            if (!success) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve waveform data");
+                return;
+            }
+
+            LOG_DEBUG("Waveform data retrieved via API");
+            _sendJsonResponse(request, doc);
+        });
+
+        // Get cloud services status
+        server.on("/api/v1/mqtt/cloud-services", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            doc["enabled"] = !globalCommunityMode && Mqtt::isCloudServicesEnabled();
+
+            _sendJsonResponse(request, doc);
+        });
+
+        // Set cloud services status
+        static AsyncCallbackJsonWebHandler *setCloudServicesHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/mqtt/cloud-services",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (globalCommunityMode) {
+                    _sendErrorResponse(request, HTTP_CODE_FORBIDDEN, "Cloud services are not available in community mode");
+                    return;
+                }
+                if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_MQTT_CLOUD_SERVICES)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                // Validate JSON structure
+                if (!doc.is<JsonObject>() || !doc["enabled"].is<bool>())
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid JSON structure. Expected: {\"enabled\": true/false}");
+                    return;
+                }
+
+                bool enabled = doc["enabled"];
+                Mqtt::setCloudServicesEnabled(enabled);
+
+                LOG_INFO("Cloud services %s via API", enabled ? "enabled" : "disabled");
+                _sendSuccessResponse(request, enabled ? "Cloud services enabled successfully" : "Cloud services disabled successfully");
+            });
+        server.addHandler(setCloudServicesHandler);
+    }
+
+    // === INFLUXDB ENDPOINTS ===
+    static void _serveInfluxDbEndpoints()
+    {
+        // Get InfluxDB configuration
+        server.on("/api/v1/influxdb/config", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            if (InfluxDbClient::getConfigurationAsJson(doc)) _sendJsonResponse(request, doc);
+            else _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Error fetching InfluxDB configuration");
+        });
+
+        // Set InfluxDB configuration
+        static AsyncCallbackJsonWebHandler *setInfluxDbHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/influxdb/config",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                bool isPartialUpdate = _isPartialUpdate(request);
+                if (!_validateRequest(request, isPartialUpdate ? "PATCH" : "PUT", HTTP_MAX_CONTENT_LENGTH_INFLUXDB)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                if (InfluxDbClient::setConfigurationFromJson(doc, isPartialUpdate))
+                {
+                    LOG_INFO("InfluxDB configuration updated via API");
+                    _sendSuccessResponse(request, "InfluxDB configuration updated successfully");
+                }
+                else
+                {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid InfluxDB configuration");
+                }
+            });
+        server.addHandler(setInfluxDbHandler);
+
+        // Reset configuration
+        server.on("/api/v1/influxdb/config/reset", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            InfluxDbClient::resetConfiguration();
+            _sendSuccessResponse(request, "InfluxDB configuration reset successfully");
+        });
+
+        // Get InfluxDB status
+        server.on("/api/v1/influxdb/status", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            // Add runtime status information
+            char statusBuffer[STATUS_BUFFER_SIZE];
+            char timestampBuffer[TIMESTAMP_BUFFER_SIZE];
+            InfluxDbClient::getRuntimeStatus(statusBuffer, sizeof(statusBuffer), timestampBuffer, sizeof(timestampBuffer));
+            doc["status"] = statusBuffer;
+            doc["statusTimestamp"] = timestampBuffer;
+            
+            _sendJsonResponse(request, doc);
+        });
+    }
+
+    // === CRASH MONITOR ENDPOINTS ===
+    static void _serveCrashEndpoints()
+    {
+        // Get crash information and analysis
+        server.on("/api/v1/crash/info", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            if (CrashMonitor::getCoreDumpInfoJson(doc)) {
+                _sendJsonResponse(request, doc);
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve crash information");
+            }
+        });
+
+        // Get core dump data (with offset and chunk size parameters)
+        server.on("/api/v1/crash/dump", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            // Parse query parameters
+            size_t offset = 0;
+            size_t chunkSize = CRASH_DUMP_DEFAULT_CHUNK_SIZE;
+
+            if (request->hasParam("offset")) {
+                offset = request->getParam("offset")->value().toInt();
+            }
+            
+            if (request->hasParam("size")) {
+                chunkSize = request->getParam("size")->value().toInt();
+                // Limit maximum chunk size to prevent memory issues
+                if (chunkSize > CRASH_DUMP_MAX_CHUNK_SIZE) {
+                    LOG_DEBUG("Chunk size too large, limiting to %zu bytes", CRASH_DUMP_MAX_CHUNK_SIZE);
+                    chunkSize = CRASH_DUMP_MAX_CHUNK_SIZE;
+                }
+                if (chunkSize == 0) {
+                    chunkSize = CRASH_DUMP_DEFAULT_CHUNK_SIZE;
+                }
+            }
+
+            if (!CrashMonitor::hasCoreDump()) {
+                _sendErrorResponse(request, HTTP_CODE_NOT_FOUND, "No core dump available");
+                return;
+            }
+
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            if (CrashMonitor::getCoreDumpChunkJson(doc, offset, chunkSize)) {
+                _sendJsonResponse(request, doc);
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve core dump data");
+            }
+        });
+
+        // Clear core dump from flash
+        server.on("/api/v1/crash/clear", HTTP_POST, [](AsyncWebServerRequest *request)
+                  {
+            if (!_validateRequest(request, "POST")) return;
+
+            if (CrashMonitor::hasCoreDump()) {
+                CrashMonitor::clearCoreDump();
+                LOG_INFO("Core dump cleared via API");
+                _sendSuccessResponse(request, "Core dump cleared successfully");
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_NOT_FOUND, "No core dump available to clear");
+            }
+        });
+    }
+
+    // === LED ENDPOINTS ===
+    static void _serveLedEndpoints()
+    {
+        // TODO: can we add a fun RGB LED control here? Of limited time of course, but it would allow for ha integrations
+        // Get LED brightness
+        server.on("/api/v1/led/brightness", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            doc["brightness"] = Led::getBrightness();
+            doc["max_brightness"] = LED_MAX_BRIGHTNESS_PERCENT;
+            _sendJsonResponse(request, doc);
+        });
+
+        // Set LED brightness
+        static AsyncCallbackJsonWebHandler *setLedBrightnessHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/led/brightness",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "PUT", HTTP_MAX_CONTENT_LENGTH_LED_BRIGHTNESS)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                // Check if brightness field is provided and is a number
+                if (!doc["brightness"].is<uint8_t>()) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing or invalid brightness parameter");
+                    return;
+                }
+
+                uint8_t brightness = doc["brightness"].as<uint8_t>();
+
+                // Validate brightness range
+                if (!Led::isBrightnessValid(brightness)) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Brightness value out of range");
+                    return;
+                }
+
+                // Set the brightness
+                Led::setBrightness(brightness);
+                _sendSuccessResponse(request, "LED brightness updated successfully");
+            });
+        server.addHandler(setLedBrightnessHandler);
+    }
+
+    // === BACKUP ENDPOINTS ===
+    static void _serveBackupEndpoints()
+    {
+        server.on("/api/v1/backup/configuration", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            // nvsDataToJson() resets watchdog periodically during iteration
+            AsyncJsonResponse * response = new AsyncJsonResponse();
+            JsonObject doc = response->getRoot().to<JsonObject>();
+
+            if (!nvsDataToJson(doc)) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve NVS data");
+                LOG_ERROR("Failed to retrieve NVS data for backup request via API");
+                delete response;
+                return;
+            }
+
+            // Add download headers
+            char deviceId[DEVICE_ID_BUFFER_SIZE];
+            getDeviceId(deviceId, sizeof(deviceId));
+            char timestamp[TIMESTAMP_BUFFER_SIZE];
+            CustomTime::getTimestampIso(timestamp, sizeof(timestamp));
+
+            char filename[128];
+            snprintf(filename, sizeof(filename), "attachment; filename=\"config_backup_%s_%s.json\"",
+                     deviceId, timestamp);
+            response->addHeader("Content-Disposition", filename);
+
+            LOG_INFO("Configuration backup requested via API: config_backup_%s_%s.json", deviceId, timestamp);
+            response->setLength();
+            request->send(response);
+        });
+
+        // LittleFS filesystem backup (tar) - streams directly to HTTP response, no temp files
+        server.on("/api/v1/backup/filesystem", HTTP_GET, [](AsyncWebServerRequest *request) {
+            LOG_DEBUG("LittleFS streaming backup requested");
+
+            // Start async TAR creation task
+            RingBufferStream* stream = startStreamingBackup();
+            if (!stream) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to start backup stream");
+                LOG_ERROR("Failed to start LittleFS backup stream via API");
+                return;
+            }
+
+            // Set up chunked response that reads from RingBufferStream
+            // Use simpler callback to avoid compiler memory issues
+            AsyncWebServerResponse *response = request->beginChunkedResponse("application/x-tar",
+                [stream](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+                    // Feed watchdog on every callback to prevent timeout during semaphore waits
+                    esp_task_wdt_reset();
+
+                    if (stream->hasError()) {
+                        delete stream;
+                        return 0;
+                    }
+                    size_t bytesRead = stream->readBytes(buffer, maxLen);
+                    if (bytesRead == 0) {
+                        delete stream;
+                    }
+                    return bytesRead;
+                }
+            );
+
+            // Add download headers with device ID and timestamp
+            char deviceId[DEVICE_ID_BUFFER_SIZE];
+            getDeviceId(deviceId, sizeof(deviceId));
+            char timestamp[TIMESTAMP_BUFFER_SIZE];
+            CustomTime::getTimestampIso(timestamp, sizeof(timestamp));
+
+            char filename[128];
+            snprintf(filename, sizeof(filename), "attachment; filename=\"littlefs_backup_%s_%s.tar\"",
+                     deviceId, timestamp);
+            response->addHeader("Content-Disposition", filename);
+
+            LOG_INFO("LittleFS backup streaming started: littlefs_backup_%s_%s.tar", deviceId, timestamp);
+            request->send(response);
+        });
+    }
+
+    // === RESTORE ENDPOINTS ===
+    static void _serveRestoreEndpoints()
+    {
+        // POST - Restore configuration from JSON backup file (multipart upload)
+        server.on("/api/v1/restore/configuration", HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+                // Final response after file upload completes
+                if (request->_tempObject) {
+                    bool* success = (bool*)request->_tempObject;
+                    if (*success) {
+                        _sendSuccessResponse(request, "Configuration restore initiated. Device will restart.");
+                    } else {
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Failed to process backup file. Check logs");
+                    }
+                    delete success;
+                    request->_tempObject = nullptr;
+                }
+            },
+            [](AsyncWebServerRequest *request, const String& filename,
+               size_t index, uint8_t *data, size_t len, bool final) {
+
+                static File restoreFile;
+                static String tempPath = "/restore/nvs_restore_upload.json";
+                static bool isValid = true;
+                static bool restoreInProgress = false;
+
+                if (!index) {
+                    // First chunk - check if restore already in progress
+                    if (restoreInProgress) {
+                        LOG_WARNING("Configuration restore already in progress, rejecting new request");
+                        _sendErrorResponse(request, HTTP_CODE_CONFLICT,
+                            "Restore already in progress. Please wait for current restore to complete.");
+                        return;
+                    }
+                    restoreInProgress = true;
+
+                    // First chunk - create restore directory and file
+                    LOG_INFO("Starting configuration restore upload");
+
+                    if (!LittleFS.exists("/restore")) {
+                        LittleFS.mkdir("/restore");
+                    }
+
+                    // Remove old temp file if exists
+                    if (LittleFS.exists(tempPath)) {
+                        LittleFS.remove(tempPath);
+                    }
+
+                    restoreFile = LittleFS.open(tempPath, FILE_WRITE);
+                    if (!restoreFile) {
+                        LOG_ERROR("Failed to create temp restore file");
+                        isValid = false;
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to create restore file");
+                        return;
+                    }
+                    isValid = true;
+                }
+
+                // Write chunk
+                if (len && isValid && restoreFile) {
+                    size_t written = restoreFile.write(data, len);
+                    if (written != len) {
+                        LOG_ERROR("Failed to write restore file chunk");
+                        isValid = false;
+                        restoreFile.close();
+                        LittleFS.remove(tempPath);
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to write restore data");
+                        return;
+                    }
+                }
+
+                // Final chunk - validate and process JSON
+                if (final && isValid && restoreFile) {
+                    restoreInProgress = false;
+                    restoreFile.close();
+                    LOG_DEBUG("Backup file upload complete, validating...");
+
+                    // Parse and validate JSON
+                    File uploadedFile = LittleFS.open(tempPath, FILE_READ);
+                    if (!uploadedFile) {
+                        LOG_ERROR("Failed to read uploaded restore file");
+                        isValid = false;
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to read restore file");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    SpiRamAllocator allocator;
+                    JsonDocument doc(&allocator);
+                    DeserializationError jsonError = deserializeJson(doc, uploadedFile);
+                    uploadedFile.close();
+
+                    if (jsonError) {
+                        LOG_ERROR("Invalid JSON in backup: %s", jsonError.c_str());
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid JSON format");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Validate backup structure
+                    if (!doc["version"].is<int>() || doc["version"] != 1 ||
+                        !doc["type"].is<const char*>() || strcmp(doc["type"], "configuration") != 0 ||
+                        !doc["nvs"].is<JsonObject>()) {
+                        LOG_ERROR("Invalid backup format or version");
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid backup format");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Check firmware version compatibility
+                    if (!doc["firmwareVersion"].is<const char*>()) {
+                        LOG_ERROR("Backup missing firmware version");
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Backup missing firmware version");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    const char* backupFwVersion = doc["firmwareVersion"];
+                    if (!isBackupVersionCompatible(backupFwVersion)) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                            "Firmware version incompatible: backup from %s, current %s. "
+                            "Can only restore backups from same major version <= current.",
+                            backupFwVersion, FIRMWARE_BUILD_VERSION);
+                        LOG_WARNING("%s", msg);
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, msg);
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Check device ID mismatch (warn but allow with ?force=true)
+                    bool forceRestore = request->hasParam("force") &&
+                                       request->getParam("force")->value() == "true";
+
+                    const char* backupDeviceId = doc["deviceId"];
+                    char currentDeviceId[DEVICE_ID_BUFFER_SIZE];
+                    getDeviceId(currentDeviceId, sizeof(currentDeviceId));
+
+                    if (backupDeviceId && strcmp(backupDeviceId, currentDeviceId) != 0 && !forceRestore) {
+                        char msg[200];
+                        snprintf(msg, sizeof(msg),
+                            "Device ID mismatch: backup from %s, current device %s. Use ?force=true to override.",
+                            backupDeviceId, currentDeviceId);
+                        LOG_WARNING("%s", msg);
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, msg);
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Validate namespace exclusions (ensure no sensitive data)
+                    const char* excludedNamespaces[] = {EXCLUDED_NVS_NAMESPACES_LIST};
+                    for (JsonPair nsPair : doc["nvs"].as<JsonObject>()) {
+                        for (const char* excluded : excludedNamespaces) {
+                            if (strcmp(nsPair.key().c_str(), excluded) == 0) {
+                                LOG_ERROR("Backup contains excluded namespace: %s", nsPair.key().c_str());
+                                LittleFS.remove(tempPath);
+                                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST,
+                                    "Backup contains excluded namespace (security/device-specific data)");
+                                bool* result = new bool(false);
+                                request->_tempObject = result;
+                                return;
+                            }
+                        }
+                    }
+
+                    // All validation passed - save for boot-time restore
+                    File finalRestoreFile = LittleFS.open("/restore/nvs_restore.json", FILE_WRITE);
+                    if (!finalRestoreFile) {
+                        LOG_ERROR("Failed to create final restore file");
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to save restore file");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    serializeJson(doc, finalRestoreFile);
+                    finalRestoreFile.close();
+                    LittleFS.remove(tempPath);
+
+                    // Set restore pending flag in NVS
+                    Preferences prefs;
+                    if (prefs.begin(PREFERENCES_NAMESPACE_GENERAL, false)) {
+                        prefs.putBool("restore_pending", true);
+                        prefs.end();
+                    }
+
+                    LOG_INFO("Configuration restore staged. Device will restart.");
+                    bool* result = new bool(true);
+                    request->_tempObject = result;
+
+                    // Trigger restart after response sent
+                    setRestartSystem("Configuration restore");
+                }
+            }
+        );
+
+        // POST - Restore filesystem from TAR file upload (saves to LittleFS then extracts)
+        server.on("/api/v1/restore/filesystem", HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+                // Final response after file upload completes
+                if (request->_tempObject) {
+                    bool* success = (bool*)request->_tempObject;
+                    if (*success) {
+                        _sendSuccessResponse(request, "Filesystem restored successfully");
+                    } else {
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Filesystem restore failed");
+                    }
+                    delete success;
+                    request->_tempObject = nullptr;
+                }
+            },
+            [](AsyncWebServerRequest *request, const String& filename,
+               size_t index, uint8_t *data, size_t len, bool final) {
+
+                static File restoreFile;
+                static String tempPath = "/restore/filesystem_restore.tar";
+                static bool isValid = true;
+                static bool restoreInProgress = false;
+
+                if (!index) {
+                    // First chunk - check if restore already in progress
+                    if (restoreInProgress) {
+                        LOG_WARNING("Filesystem restore already in progress, rejecting new request");
+                        _sendErrorResponse(request, HTTP_CODE_CONFLICT,
+                            "Restore already in progress. Please wait for current restore to complete.");
+                        return;
+                    }
+                    restoreInProgress = true;
+
+                    // First chunk - create restore directory and file
+                    LOG_INFO("Starting filesystem restore upload: %s", filename.c_str());
+
+                    if (!LittleFS.exists("/restore")) {
+                        LittleFS.mkdir("/restore");
+                    }
+
+                    // Remove old temp file if exists
+                    if (LittleFS.exists(tempPath)) {
+                        LittleFS.remove(tempPath);
+                    }
+
+                    restoreFile = LittleFS.open(tempPath, FILE_WRITE);
+                    if (!restoreFile) {
+                        LOG_ERROR("Failed to create temp restore file");
+                        isValid = false;
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to create restore file");
+                        return;
+                    }
+                    isValid = true;
+                }
+
+                // Write chunk
+                if (len && isValid && restoreFile) {
+                    size_t written = restoreFile.write(data, len);
+                    if (written != len) {
+                        LOG_ERROR("Failed to write restore file chunk");
+                        isValid = false;
+                        restoreFile.close();
+                        LittleFS.remove(tempPath);
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to write restore data");
+                        return;
+                    }
+                }
+
+                // Final chunk - extract TAR to filesystem
+                if (final && isValid && restoreFile) {
+                    restoreInProgress = false;
+                    restoreFile.close();
+                    LOG_DEBUG("TAR file upload complete, extracting...");
+
+                    bool extractSuccess = false;
+
+                    TarUnpacker *tarUnpacker = new TarUnpacker();
+                    tarUnpacker->haltOnError(true);
+                    tarUnpacker->setTarVerify(true);
+
+                    // Feed watchdog on each file extracted to prevent HTTP timeout during long extraction
+                    tarUnpacker->setTarStatusProgressCallback([](const char* name, size_t size, size_t total_unpacked) {
+                        esp_task_wdt_reset();
+                        LOG_DEBUG("Extracting: %s (%zu bytes, total unpacked: %zu)", name, size, total_unpacked);
+                    });
+
+                    // Extract: sourceFS, sourcePath, destFS, destPath
+                    if (tarUnpacker->tarExpander(LittleFS, tempPath.c_str(), LittleFS, "/")) {
+                        LOG_INFO("Filesystem restore extraction successful");
+                        extractSuccess = true;
+                    } else {
+                        LOG_ERROR("TAR extraction failed with error code: %d", tarUnpacker->tarGzGetError());
+                    }
+
+                    delete tarUnpacker;
+
+                    // Clean up temp file
+                    LittleFS.remove(tempPath);
+
+                    // Store result for completion handler
+                    bool* result = new bool(extractSuccess);
+                    request->_tempObject = result;
+                }
+            }
+        );
+    }
+
+    // === FILE OPERATION ENDPOINTS ===
+    static void _serveFileEndpoints()
+    {
+        // List files in LittleFS. The endpoint cannot be only "files" as it conflicts with the file serving endpoint (defined below)
+        // Optional query parameter: folder (e.g., /api/v1/list-files?folder=energy/daily)
+        server.on("/api/v1/list-files", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            SpiRamAllocator allocator;
+            JsonDocument doc(&allocator);
+            
+            // Check for optional folder parameter
+            const char* folderPath = nullptr;
+            if (request->hasParam("folder")) {
+                folderPath = request->getParam("folder")->value().c_str();
+            }
+            
+            if (listLittleFsFiles(doc, folderPath)) {
+                _sendJsonResponse(request, doc);
+            } else {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to list LittleFS files");
+            }
+        });
+
+        // GET - Download file from LittleFS
+        server.on("/api/v1/files/*", HTTP_GET, [](AsyncWebServerRequest *request)
+        {
+            String url = request->url();
+            String filename = url.substring(url.indexOf("/api/v1/files/") + 14);
+            
+            if (filename.length() == 0) {
+                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "File path cannot be empty");
+                return;
+            }
+            
+            // URL decode the filename
+            filename.replace("%2F", "/");
+            filename.replace("%2f", "/");
+            
+            // Ensure filename starts with "/"
+            if (!filename.startsWith("/")) {
+                filename = "/" + filename;
+            }
+
+            // Check if file exists
+            if (!LittleFS.exists(filename)) {
+                _sendErrorResponse(request, HTTP_CODE_NOT_FOUND, "File not found");
+                return;
+            }
+
+            // Determine content type
+            const char* contentType = getContentTypeFromFilename(filename.c_str());
+
+            // Check if download is forced
+            bool forceDownload = request->hasParam("download");
+
+            // Determine if this file should use caching
+            bool shouldCache = filename.endsWith(".csv") || 
+                            filename.endsWith(".csv.gz") ||
+                            filename.startsWith("/energy/monthly/") ||
+                            filename.startsWith("/energy/yearly/");
+            
+            if (shouldCache) {
+                // Send with ETag caching
+                _sendFileWithEtag(request, filename.c_str(), contentType, forceDownload);
+            } else {
+                // Send directly without caching (for frequently changing files)
+                request->send(LittleFS, filename, contentType, forceDownload);
+            }
+        });
+
+
+        // POST - Upload file to LittleFS
+        server.on("/api/v1/files/*", HTTP_POST, 
+            [](AsyncWebServerRequest *request) {
+                // Final response is handled in _handleFileUploadData
+            },
+            [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+                _handleFileUploadData(request, filename, index, data, len, final);
+            }
+        );
+
+        // DELETE - Remove file from LittleFS
+        // HACK: using POST with JSON body to avoid wildcard DELETE issues with AsyncWebServer, and also not using the same endpoint as the * would catch files/delete
+        static AsyncCallbackJsonWebHandler *deleteFileHandler = new AsyncCallbackJsonWebHandler(
+            "/api/v1/delete-file",
+            [](AsyncWebServerRequest *request, JsonVariant &json)
+            {
+                if (!_validateRequest(request, "POST", HTTP_MAX_CONTENT_LENGTH_CUSTOM_MQTT)) return;
+
+                SpiRamAllocator allocator;
+                JsonDocument doc(&allocator);
+                doc.set(json);
+
+                // Validate path field
+                if (!doc["path"].is<const char*>()) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Missing or invalid 'path' field in JSON body");
+                    return;
+                }
+
+                String filename = doc["path"].as<const char*>();
+                
+                if (filename.length() == 0) {
+                    _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "File path cannot be empty");
+                    return;
+                }
+                
+                // Ensure filename starts with "/"
+                if (!filename.startsWith("/")) {
+                    filename = "/" + filename;
+                }
+
+                // Check if file exists
+                if (!LittleFS.exists(filename)) {
+                    LOG_DEBUG("Tried to delete non-existent file: %s", filename.c_str());
+                    char buffer[NAME_BUFFER_SIZE];
+                    snprintf(buffer, sizeof(buffer), "File not found: %s", filename.c_str());
+                    _sendErrorResponse(request, HTTP_CODE_NOT_FOUND, buffer);
+                    return;
+                }
+
+                // Attempt to delete the file
+                if (LittleFS.remove(filename)) {
+                    LOG_INFO("File deleted successfully: %s", filename.c_str());
+                    _sendSuccessResponse(request, "File deleted successfully");
+                } else {
+                    LOG_ERROR("Failed to delete file: %s", filename.c_str());
+                    _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to delete file");
+                }
+            });
+        server.addHandler(deleteFileHandler);
+    }
+
+    TaskInfo getHealthCheckTaskInfo()
+    {
+        return getTaskInfoSafely(_healthCheckTaskHandle, HEALTH_CHECK_TASK_STACK_SIZE, &_healthCheckHeartbeat);
+    }
+
+    TaskInfo getOtaTimeoutTaskInfo()
+    {
+        return getTaskInfoSafely(_otaTimeoutTaskHandle, OTA_TIMEOUT_TASK_STACK_SIZE);
+    }
+}

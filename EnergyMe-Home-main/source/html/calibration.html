@@ -1,0 +1,596 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Copyright (C) 2025 Jibril Sharafi -->
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <link rel="stylesheet" type="text/css" href="/css/button.css">
+    <link rel="stylesheet" type="text/css" href="/css/styles.css">
+    <link rel="stylesheet" type="text/css" href="/css/section.css">
+    <link rel="stylesheet" type="text/css" href="/css/typography.css">
+    <link rel="stylesheet" type="text/css" href="/css/forms.css">
+    <link rel="stylesheet" type="text/css" href="/css/tooltip.css">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+
+    <title>Calibration</title>
+    <style>
+        .calibration-container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .calibration-controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .scaling-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .scaling-value {
+            min-width: 60px;
+            text-align: center;
+            font-weight: bold;
+            color: #2c3e50;
+            padding: 5px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background-color: #f8f9fa;
+        }
+
+        .scaling-btn {
+            padding: 5px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .scaling-btn:hover {
+            background-color: #0056b3;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .control-group label {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .control-group select,
+        .control-group input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .slider-container input[type="range"] {
+            flex: 1;
+        }
+
+        .slider-value {
+            min-width: 60px;
+            text-align: center;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+
+        #meterTable {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        #meterTable th,
+        #meterTable td {
+            padding: 10px 8px;
+            border: 1px solid #ddd;
+        }
+
+        #meterTable th {
+            background-color: #f8f9fa;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+
+        #meterTable td:first-child {
+            font-weight: bold;
+            background-color: #f8f9fa;
+        }
+
+        .status-indicator {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .status-good { background-color: #d4edda; color: #155724; }
+        .status-warning { background-color: #fff3cd; color: #856404; }
+        .status-error { background-color: #f8d7da; color: #721c24; }
+
+        .calibration-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        @media (max-width: 768px) {
+            .calibration-controls {
+                grid-template-columns: 1fr;
+                gap: 12px;
+                max-width: 100%;
+                padding: 0 10px;
+            }
+            
+            .scaling-controls {
+                flex-direction: column;
+                gap: 8px;
+                align-items: stretch;
+            }
+            
+            .scaling-value {
+                min-width: auto;
+                width: 100%;
+                font-size: 14px;
+                padding: 8px;
+            }
+            
+            .scaling-btn {
+                width: 100%;
+                padding: 10px;
+                font-size: 16px; /* Prevents zoom on iOS */
+            }
+            
+            .control-group select,
+            .control-group input {
+                width: 100%;
+                font-size: 16px; /* Prevents zoom on iOS */
+                padding: 12px;
+                box-sizing: border-box;
+            }
+            
+            .control-group label {
+                font-size: 14px;
+                margin-bottom: 5px;
+            }
+            
+            .slider-container {
+                flex-direction: column;
+                gap: 8px;
+                align-items: stretch;
+            }
+            
+            .slider-container input[type="range"] {
+                width: 100%;
+                height: 30px;
+            }
+            
+            .slider-value {
+                min-width: auto;
+                width: 100%;
+                font-size: 16px;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: #f8f9fa;
+            }
+            
+            #meterTable {
+                font-size: 12px;
+                overflow-x: auto;
+                display: block;
+                white-space: nowrap;
+            }
+            
+            #meterTable thead,
+            #meterTable tbody,
+            #meterTable tr {
+                display: block;
+            }
+            
+            #meterTable td,
+            #meterTable th {
+                display: block;
+                width: 100%;
+                padding: 8px 5px;
+                border: none;
+                text-align: left;
+                border-bottom: 1px solid #eee;
+            }
+            
+            #meterTable th {
+                background-color: #f5f5f5;
+                font-weight: bold;
+            }
+            
+            #meterTable tr {
+                border-bottom: 2px solid #ddd;
+                margin-bottom: 10px;
+            }
+            
+            .calibration-actions {
+                flex-direction: column;
+                gap: 8px;
+            }
+            
+            .status-indicator {
+                font-size: 11px;
+                padding: 3px 6px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .calibration-controls {
+                padding: 0 5px;
+                gap: 10px;
+            }
+            
+            .scaling-btn {
+                padding: 8px;
+                font-size: 14px;
+            }
+            
+            .control-group select,
+            .control-group input {
+                font-size: 14px;
+                padding: 10px;
+            }
+            
+            .control-group label {
+                font-size: 13px;
+            }
+            
+            .slider-value {
+                font-size: 14px;
+                padding: 6px;
+            }
+            
+            #meterTable {
+                font-size: 11px;
+            }
+            
+            #meterTable td,
+            #meterTable th {
+                padding: 6px 4px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="buttonNavigation-container">
+        <a class="buttonNavigation" type="outer" href="/configuration">⚙️ Configuration</a>
+        <a class="buttonNavigation" type="inner" href="/ade7953-tester">🔬 Register Tester</a>
+        <a class="buttonNavigation" type="inner" href="/waveform">📊 Waveform Capture</a>
+    </div>
+
+    <div class="section-box">
+        <h1>Current Transformer (CT) Calibration</h1>
+
+        <div class="calibration-container">
+            <!-- Calibration Controls -->
+            <div class="calibration-controls">
+                <div class="control-group">
+                    <label for="channelSelect">Select Channel:</label>
+                    <select id="channelSelect" onchange="onChannelChange()">
+                        <option value="">Loading channels...</option>
+                    </select>
+                </div>
+
+                <div class="control-group">
+                    <label for="voltageOutput">CT Voltage Output (V RMS):<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about CT Voltage Output">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            The AC voltage the CT outputs at its rated primary current. Do not exceed (at your expected maximum current) 0.5 V absolute to avoid damaging the ADE7953. For instance, if your maximum expected current is 30 A, a CT rated for 75A/1V may work.
+                        </div>
+                    </span></label>
+                    <input type="number" id="voltageOutput" min="0.001" max="10" step="0.001" value="0.333" onchange="onCalibrationChange()" style="padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                </div>
+
+                <div class="control-group">
+                    <label for="currentRating">CT Current Rating (A RMS):<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about CT Current Rating">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            The maximum primary (measured) current the CT is rated for, as printed on the CT body or datasheet (e.g. 30 A, 100 A). Must match your installed CT exactly.
+                        </div>
+                    </span></label>
+                    <input type="number" id="currentRating" min="1" max="2000" step="1" value="30" onchange="onCalibrationChange()" style="padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                </div>
+
+                <div class="control-group">
+                    <label for="scalingPercentage">Scaling Factor (%):<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Scaling Factor">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Fine-tune correction applied on top of the base calibration (%). Use this to adjust for minor discrepancies, checking the current and active power against a known reference.
+                        </div>
+                    </span></label>
+                    <div class="scaling-controls">
+                        <button class="scaling-btn" onclick="adjustScaling(-1)">-</button>
+                        <span class="scaling-value" id="scalingValue">0.0%</span>
+                        <button class="scaling-btn" onclick="adjustScaling(1)">+</button>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <div id="calibrationStatus" style="margin-bottom: 10px;"></div>
+                    <div class="calibration-actions">
+                        <button class="buttonForm" onclick="saveCalibration()" id="saveButton">💾 Save</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live Meter Data Table at Bottom -->
+            <div>
+                <h3>Live Meter Data</h3>
+                <table id="meterTable">
+                    <tr>
+                        <th>Channel</th>
+                        <th>Voltage (V)</th>
+                        <th>Current (A)</th>
+                        <th>Active Power (W)</th>
+                        <th>Apparent Power (VA)</th>
+                        <th>Reactive Power (VAR)</th>
+                        <th>Power Factor (%)</th>
+                    </tr>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/api-client.js"></script>
+    <script src="/js/issues.js"></script>
+    <script src="/js/tooltip.js"></script>
+    <script>
+        var channelData = {};
+        var meterData = [];
+        var selectedChannelIndex = null;
+        var powerUpdateInterval = null;
+        var scalingPercentage = 0; // Store as percentage
+        const FETCH_THROTTLE = 2000;
+
+        // Initialize the page
+        async function initializePage() {
+            try {
+                const channelResponse = await energyApi.getChannelConfig();
+                channelData = channelResponse;
+
+                populateChannelDropdown();
+                startLiveMeterUpdates();
+            } catch (error) {
+                console.error('Error initializing page:', error);
+                showStatus('Error loading data: ' + error.message, 'error');
+            }
+        }
+
+        function populateChannelDropdown() {
+            const dropdown = document.getElementById('channelSelect');
+            dropdown.innerHTML = '<option value="">Select a channel...</option>';
+
+            Object.entries(channelData).forEach(([index, channel]) => {
+                if (channel.active) {
+                    const option = document.createElement('option');
+                    option.value = index;
+                    option.textContent = `Channel ${index}: ${channel.label}`;
+                    dropdown.appendChild(option);
+                }
+            });
+        }
+
+        function onChannelChange() {
+            const channelIndex = document.getElementById('channelSelect').value;
+            selectedChannelIndex = channelIndex;
+
+            if (channelIndex && channelData[channelIndex]) {
+                const channel = channelData[channelIndex];
+                
+                // Load current channel calibration
+                if (channel.ctSpecification) {
+                    document.getElementById('currentRating').value = channel.ctSpecification.currentRating || 30;
+                    document.getElementById('voltageOutput').value = channel.ctSpecification.voltageOutput || 0.333;
+                    scalingPercentage = (channel.ctSpecification.scalingFraction || 0.0) * 100;
+                    updateScalingDisplay();
+                }
+                
+                document.getElementById('calibrationStatus').innerHTML = `
+                    <div class="status-indicator status-good">
+                        Selected: ${channel.label} (Channel ${channelIndex})
+                    </div>
+                `;
+            } else {
+                document.getElementById('calibrationStatus').innerHTML = '';
+            }
+        }
+
+        function onCalibrationChange() {
+            updateCalibrationPreview();
+        }
+
+        function updateScalingDisplay() {
+            document.getElementById('scalingValue').textContent = scalingPercentage.toFixed(1) + '%';
+        }
+
+        function adjustScaling(direction) {
+            scalingPercentage += direction * 0.1; // 0.1% increments
+            scalingPercentage = Math.max(-50, Math.min(50, scalingPercentage)); // Clamp to -50% to +50%
+            updateScalingDisplay();
+            updateCalibrationPreview();
+        }
+
+        function updateSliderValue() {
+            const value = document.getElementById('scalingSlider').value;
+            document.getElementById('scalingValue').textContent = parseFloat(value).toFixed(2);
+        }
+
+        function updateCalibrationPreview() {
+            if (!selectedChannelIndex) return;
+
+            const currentRating = document.getElementById('currentRating').value;
+            const voltageOutput = document.getElementById('voltageOutput').value;
+
+            document.getElementById('calibrationStatus').innerHTML = `
+                <div class="status-indicator status-warning">
+                    Preview: ${currentRating}A CT, ${voltageOutput}V output, Scaling: ${scalingPercentage.toFixed(1)}%
+                </div>
+            `;
+        }
+
+        async function saveCalibration() {
+            if (!selectedChannelIndex) {
+                showStatus('Please select a channel first', 'error');
+                return;
+            }
+
+            try {
+                const saveButton = document.getElementById('saveButton');
+                saveButton.disabled = true;
+                saveButton.classList.add('loading');
+
+                showStatus('Saving calibration...', 'info');
+
+                const currentRating = parseInt(document.getElementById('currentRating').value);
+                const voltageOutput = parseFloat(document.getElementById('voltageOutput').value);
+                const scalingFraction = scalingPercentage / 100; // Convert percentage to fraction
+
+                const channelUpdate = {
+                    index: parseInt(selectedChannelIndex),
+                    ctSpecification: {
+                        currentRating: currentRating,
+                        voltageOutput: voltageOutput,
+                        scalingFraction: scalingFraction
+                    }
+                };
+
+                await energyApi.patchChannelConfig(channelUpdate);
+
+                // Update local data
+                channelData[selectedChannelIndex].ctSpecification = channelUpdate.ctSpecification;
+
+                showStatus('Calibration saved successfully!', 'success');
+
+            } catch (error) {
+                console.error('Error saving calibration:', error);
+                showStatus('Error saving calibration: ' + error.message, 'error');
+            } finally {
+                saveButton.disabled = false;
+                saveButton.classList.remove('loading');
+            }
+        }
+
+        function startLiveMeterUpdates() {
+            if (powerUpdateInterval) {
+                clearInterval(powerUpdateInterval);
+            }
+
+            const updateMeterData = async () => {
+                try {
+                    const meterValuesArray = await energyApi.getMeterValues();
+                    meterData = meterValuesArray;
+                    updateMeterTable();
+                } catch (error) {
+                    console.error('Error fetching meter data:', error);
+                }
+            };
+
+            updateMeterData();
+            powerUpdateInterval = setInterval(updateMeterData, FETCH_THROTTLE);
+        }
+
+        function updateMeterTable() {
+            const table = document.getElementById("meterTable");
+            table.innerHTML = `
+                <tr>
+                    <th>Channel</th>
+                    <th>Voltage (V)<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Voltage">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            RMS voltage.
+                        </div>
+                    </span></th>
+                    <th>Current (A)<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Current">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            RMS current.
+                        </div>
+                    </span></th>
+                    <th>Active Power (W)<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Active Power">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Real power actually consumed or generated, in watts. This is what your electricity meter bills. Always less than or equal to Apparent Power.
+                        </div>
+                    </span></th>
+                    <th>Apparent Power (VA)<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Apparent Power">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Total power drawn from the supply including reactive power, in volt-amperes. Apparent = Voltage × Current (without regard to phase). Always positive, and greater than or equal to Active Power.
+                        </div>
+                    </span></th>
+                    <th>Reactive Power (VAR)<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Reactive Power">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Power oscillating between source and inductive/capacitive load without doing useful work, in volt-ampere-reactive. Inductive loads (motors, transformers) have positive reactive power; capacitive loads have negative. You (usually) don't pay for this.
+                        </div>
+                    </span></th>
+                    <th>Power Factor<span class="info-tooltip">
+                        <button class="info-tooltip-icon" onclick="toggleTooltip(this, event)" aria-label="More info about Power Factor">ⓘ</button>
+                        <div class="info-tooltip-popover" role="tooltip">
+                            Ratio of Active Power to Apparent Power (0 to 1 or 0% to 100%). A value of 1.0 means purely resistive load (heaters, incandescent bulbs). Low values (&lt; 0.8) indicate significant inductive or capacitive loading (motors, switching power supplies).
+                        </div>
+                    </span></th>
+                </tr>
+            `;
+
+            meterData.forEach(meter => {
+                const row = table.insertRow();
+                const isSelected = meter.index == selectedChannelIndex;
+                
+                if (isSelected) {
+                    row.style.backgroundColor = '#e8f4f8';
+                    row.style.fontWeight = 'bold';
+                }
+
+                row.innerHTML = `
+                    <td>${meter.label} (${meter.index})</td>
+                    <td>${meter.data.voltage.toFixed(1)}</td>
+                    <td>${meter.data.current.toFixed(2)}</td>
+                    <td>${meter.data.activePower.toFixed(1)}</td>
+                    <td>${meter.data.apparentPower.toFixed(1)}</td>
+                    <td>${meter.data.reactivePower.toFixed(1)}</td>
+                    <td>${(Math.abs(meter.data.powerFactor) * 100).toFixed(1)}%</td>
+                `;
+            });
+        }
+
+        // Initialize page on load
+        document.addEventListener('DOMContentLoaded', initializePage);
+
+    </script>
+</body>
+
+</html>

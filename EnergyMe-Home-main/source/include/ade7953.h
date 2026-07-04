@@ -1,0 +1,664 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Jibril Sharafi
+
+#pragma once
+
+#include <AdvancedLogger.h>
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include <set>
+#include <SPI.h>
+#include <Preferences.h>
+#include <rom/crc.h>
+#include <Update.h>
+#include <vector>
+
+#include "ade7953registers.h"
+#include "multiplexer.h"
+#include "customtime.h"
+#include "mqtt.h"
+#include "binaries.h"
+#include "constants.h"
+#include "factory_keys.h"
+#include "structs.h"
+#include "utils.h"
+#include "hardware_profile.h"
+
+#include "channel_types.h"   // ChannelRole (shared, Arduino-free - see lib/meter_logic)
+#include "meter_logic.h"     // pure CT-polarity / clamp / WDRR decisions (host-testable)
+
+// SPI
+#define ADE7953_SPI_FREQUENCY 2000000 // The maximum SPI frequency for the ADE7953 is 2MHz
+#define ADE7953_SPI_MUTEX_TIMEOUT_MS 100
+#define ADE7953_SPI_OPERATION_MUTEX_TIMEOUT_MS 200 // Longer than normal SPI since this accounts also for validation
+
+// Tasks
+#define ADE7953_METER_READING_TASK_NAME "ade7953_task"
+#define ADE7953_METER_READING_TASK_STACK_SIZE (8 * 1024) // Week-long peak ~5358 bytes (43.6%); 8 KB leaves ~33% margin and frees 4 KB of internal heap
+#define ADE7953_METER_READING_TASK_PRIORITY 5
+
+#define ADE7953_ENERGY_SAVE_TASK_NAME "energy_save_task"
+#define ADE7953_ENERGY_SAVE_TASK_STACK_SIZE (5 * 1024) // Around 4.5 kB usage
+#define ADE7953_ENERGY_SAVE_TASK_PRIORITY 1
+
+#define ADE7953_HOURLY_CSV_SAVE_TASK_NAME "hourly_csv_task"
+#define ADE7953_HOURLY_CSV_SAVE_TASK_STACK_SIZE (6 * 1024) // No more than 5 kB. A bit larger for safety
+#define ADE7953_HOURLY_CSV_SAVE_TASK_PRIORITY 1
+
+#define ADE7953_HISTORY_CLEAR_TASK_NAME "hist_clear"
+#define ADE7953_HISTORY_CLEAR_TASK_STACK_SIZE (6 * 1024) // Same as hourly CSV task (does similar gz work)
+#define ADE7953_HISTORY_CLEAR_TASK_PRIORITY 1
+#define CLEAR_ALL_CHANNELS_SENTINEL 0xFE
+
+// ENERGY_SAVING
+#define SAVE_ENERGY_INTERVAL (15 * 60 * 1000) // Time between each energy save to preferences. Do not increase the frequency to avoid wearing the flash memory. In any case, this is part of the requirement. The other part is ENERGY_SAVE_THRESHOLD 
+#define ENERGY_CSV_PREFIX "/energy"
+#define ENERGY_CSV_DAILY_PREFIX ENERGY_CSV_PREFIX "/daily"
+#define ENERGY_CSV_MONTHLY_PREFIX ENERGY_CSV_PREFIX "/monthly"
+#define ENERGY_CSV_YEARLY_PREFIX ENERGY_CSV_PREFIX "/yearly"
+#define TEMPORARY_FILE_PREFIX "_temp_"
+#define DAILY_ENERGY_CSV_HEADER "timestamp,channel,active_imported,active_exported"
+#define DAILY_ENERGY_CSV_DIGITS 0 // Since the energy is in Wh, it is useless to go below 1 Wh, and we also save in space usage
+#define ENERGY_SAVE_THRESHOLD 100.0f // Threshold for saving energy data (in Wh) and in any case not more frequent than SAVE_ENERGY_INTERVAL
+#define ENERGY_CONSOLIDATION_MIN_SIZE 10 // Minimum file size (bytes) to consider consolidation successful
+
+// Interrupt handling
+#define ADE7953_INTERRUPT_TIMEOUT_MS 1000ULL // If exceed this plus sample time, something is wrong as we are not receiving the interrupt
+
+// Setup
+#define ADE7953_RESET_LOW_DURATION 200 // The duration for the reset pin to be low (minimum is way lower, but this is a safe value)
+#define ADE7953_MAX_VERIFY_COMMUNICATION_ATTEMPTS 5
+#define ADE7953_VERIFY_COMMUNICATION_INTERVAL 500
+
+// Dynamic channel scheduling (Weighted Deficit Round-Robin)
+// Weights are intentionally not normalized to 1.0. The WDRR deficit counter
+// algorithm uses relative weights: a channel with weight 2x will be sampled ~2x
+// as often. The minimum base prevents starvation.
+#define WEIGHT_POWER_SHARE 0.4f      // Weight contribution from power magnitude share
+#define WEIGHT_VARIABILITY 0.4f      // Weight contribution from power variability share
+#define WEIGHT_MIN_BASE 0.1f         // Minimum base weight to prevent starvation
+#define VARIABILITY_EMA_ALPHA 0.3f   // Exponential moving average smoothing for variability (0-1, lower = smoother)
+#define CHANNEL_MAX_GAP_MS 15000ULL  // Watchdog: max time between successful reads before forcing a pick
+#define MAX_CHANNEL_DEFICIT_BOUND 5.0f // Symmetric clamp on per-channel deficit (safety net against arithmetic edge cases)
+#define WEIGHT_ARMED_BOOST 1.5f      // Extra weight for a channel running CT-reversal detection WHILE CONDUCTING, so it is sampled rapidly and resolves in ~1-2 s
+#define WEIGHT_ROLE_PRIORITY_MULT 2.0f // Weight multiplier for grid / battery roles - mains and storage flow are sampled more often (matters most on 3-phase)
+
+// Default values for ADE7953 registers
+#define UNLOCK_OPTIMUM_REGISTER_VALUE 0xAD // Register to write to unlock the optimum register
+#define UNLOCK_OPTIMUM_REGISTER 0x00FE // Value to write to unlock the optimum register
+#define DEFAULT_OPTIMUM_REGISTER 0x0030 // Default value for the optimum register
+#define DEFAULT_EXPECTED_AP_NOLOAD_REGISTER 0x00E419 // Default expected value for AP_NOLOAD_32 (used to validate the ADE7953 communication)
+#define DEFAULT_NOLOAD_DYNAMIC_RANGE 20000 // Indicates the 1/X dynamic range before the no load feature kicks in. The higher the more sensible, but more prone to noise. Then there will be a formula to compute the register value.
+#define DEFAULT_DISNOLOAD_REGISTER 0 // 0x00 0b00000000 (enable all no-load detection)
+#define DEFAULT_LCYCMODE_REGISTER 0b01111111 // 0xFF 0b01111111 (enable accumulation mode for all channels, disable read with reset)
+#define DEFAULT_PGA_REGISTER 0 // PGA gain 1
+#define DEFAULT_CONFIG_REGISTER 0b1000000100001100 // Enable bit 2, bit 3 (line accumulation for PF), 8 (CRC is enabled), and 15 (keep HPF enabled, keep COMM_LOCK disabled)
+#define DEFAULT_IRQENA_REGISTER 0b001101000000000000000000 // Enable CYCEND interrupt (bit 18) and Reset (bit 20, mandatory) and CRC change (bit 21) for line cycle end detection
+#define MINIMUM_SAMPLE_TIME 200ULL // The settling time of the ADE7953 is 200 ms, so reading faster than this makes little sense
+
+// Channel validation ranges
+#define VALIDATE_CT_CURRENT_RATING_MIN 0.0f
+#define VALIDATE_CT_CURRENT_RATING_MAX 10000.0f // In amperes. If EnergyMe - Home ends up being used for 10000+ A, we have bigger problems than the CT specification validation :)
+#define VALIDATE_CT_VOLTAGE_OUTPUT_MIN 0.0f
+#define VALIDATE_CT_VOLTAGE_OUTPUT_MAX 1.0f // In volts. Already exceeding the 0.5 V absolute limit is enough. More than 1V should be avoided at all costs (in any case, most CTs are up to 1V max)
+#define VALIDATE_CT_SCALING_FRACTION_MIN -10.0f // If you need to multiply more than 10x times the values you read, the issue is somewhere else
+#define VALIDATE_CT_SCALING_FRACTION_MAX 10.0f
+
+// Constant hardware-fixed values
+#define FULL_SCALE_LSB_FOR_RMS_VALUES 9032007 // Maximum value of RMS registers (24-bit unsigned) - current (channel A and B) and voltage
+#define FULL_SCALE_LSB_FOR_INSTANTANEOUS_VALUES 6500000 // Maximum value of waveform registers (23-bit signed, ±6500000 at ±0.5V input)
+#define MAXIMUM_ADC_CHANNEL_INPUT 0.5f // Maximum voltage in volts (absolute) for all ADC channels in ADE7953 (both current and voltage)
+#define ENERGY_ACCUMULATION_FREQUENCY 206900 // At full input scale, an LSB is added every this frequency to the energy register
+
+// _voltPerLsb and _voltPerLsbInstantaneous are computed at runtime in Ade7953::begin() from
+// globalHwProfile->voltageDividerR1 and voltageDividerR2 (see hardware_profile.h).
+// Formulas:
+//   _voltPerLsb             = (MAXIMUM_ADC_CHANNEL_INPUT / sqrt(2)) / ratio / FULL_SCALE_LSB_FOR_RMS_VALUES
+//   _voltPerLsbInstantaneous = MAXIMUM_ADC_CHANNEL_INPUT / ratio / FULL_SCALE_LSB_FOR_INSTANTANEOUS_VALUES
+// where ratio = R2 / (R1 + R2).
+// Computed once at begin(), stored as static floats in ade7953.cpp, with no per-measurement overhead.
+#define POWER_FACTOR_CONVERSION_FACTOR 0.00003052f // PF/LSB computed as 1.0f / 32768.0f (from ADE7953 datasheet). Unused but left for reference
+#define ANGLE_CONVERSION_FACTOR 0.0807f // 0.0807 °/LSB computed as 360.0f * 50.0f / 223000.0f. Unused but left for reference
+#define GRID_FREQUENCY_CONVERSION_FACTOR 223750.0f // Clock of the period measurement, in Hz. To be multiplied by the register value of 0x10E
+#define DEFAULT_FALLBACK_FREQUENCY 50 // Most of the world is 50 Hz
+
+// Waveform capture
+#define WAVEFORM_CYCLES_TO_CAPTURE 4    // Number of line cycles to capture
+#define SAMPLING_RATE_INSTANTANEOUS_VALUES 6990 // 6.99 kHz (as given by datasheet) is the maximum rate of update of the instantaneous values
+#define WAVEFORM_BUFFER_SIZE \
+    ((size_t)(((float)WAVEFORM_CYCLES_TO_CAPTURE / (float)DEFAULT_FALLBACK_FREQUENCY) \
+              * SAMPLING_RATE_INSTANTANEOUS_VALUES * 1.2f)) // 20% margin for sampling jitter
+#define WAVEFORM_CAPTURE_MAX_DURATION_MICROS (2 * 1000000 * WAVEFORM_CYCLES_TO_CAPTURE) / DEFAULT_FALLBACK_FREQUENCY // 2x margin
+
+// Configuration Preferences Keys
+#define CONFIG_SAMPLE_TIME_KEY "sample_time"
+#define CONFIG_AV_GAIN_KEY "av_gain"
+#define CONFIG_AI_GAIN_KEY "ai_gain"
+#define CONFIG_BI_GAIN_KEY "bi_gain"
+#define CONFIG_AIRMS_OS_KEY "airms_os"
+#define CONFIG_BIRMS_OS_KEY "birms_os"
+#define CONFIG_AW_GAIN_KEY "aw_gain"
+#define CONFIG_BW_GAIN_KEY "bw_gain"
+#define CONFIG_AWATT_OS_KEY "awatt_os"
+#define CONFIG_BWATT_OS_KEY "bwatt_os"
+#define CONFIG_AVAR_GAIN_KEY "avar_gain"
+#define CONFIG_BVAR_GAIN_KEY "bvar_gain"
+#define CONFIG_AVAR_OS_KEY "avar_os"
+#define CONFIG_BVAR_OS_KEY "bvar_os"
+#define CONFIG_AVA_GAIN_KEY "ava_gain"
+#define CONFIG_BVA_GAIN_KEY "bva_gain"
+#define CONFIG_AVA_OS_KEY "ava_os"
+#define CONFIG_BVA_OS_KEY "bva_os"
+#define CONFIG_PHCAL_A_KEY "phcal_a"
+#define CONFIG_PHCAL_B_KEY "phcal_b"
+
+// Energy Preferences Keys (max 15 chars)
+#define ENERGY_ACTIVE_IMP_KEY "ch%u_actImp"    // Format: ch16_actImp (11 chars)
+#define ENERGY_ACTIVE_EXP_KEY "ch%u_actExp"    // Format: ch16_actExp (11 chars)
+#define ENERGY_REACTIVE_IMP_KEY "ch%u_reactImp" // Format: ch16_reactImp (13 chars)
+#define ENERGY_REACTIVE_EXP_KEY "ch%u_reactExp" // Format: ch16_reactExp (13 chars)
+#define ENERGY_APPARENT_KEY "ch%u_apparent"   // Format: ch16_apparent (13 chars)
+
+// Default configuration values
+#define DEFAULT_SAMPLE_TIME 200ULL // Will be converted to integer line cycles (so at 50Hz, 200ms = 10 cycles)
+#define DEFAULT_CONFIG_AV_GAIN 4050000 // Actual "calibrated" value (compared to default 0x400000)
+#define DEFAULT_CONFIG_AI_GAIN 4300000 // Actual "calibrated" value (compared to default 0x400000)
+#define DEFAULT_CONFIG_BI_GAIN 4300000 // Actual "calibrated" value (compared to default 0x400000)
+#define DEFAULT_CONFIG_AIRMS_OS 0
+#define DEFAULT_CONFIG_BIRMS_OS 0
+#define DEFAULT_CONFIG_AW_GAIN 0x400000
+#define DEFAULT_CONFIG_BW_GAIN 0x400000
+#define DEFAULT_CONFIG_AWATT_OS 0
+#define DEFAULT_CONFIG_BWATT_OS 0
+#define DEFAULT_CONFIG_AVAR_GAIN 0x400000
+#define DEFAULT_CONFIG_BVAR_GAIN 0x400000
+#define DEFAULT_CONFIG_AVAR_OS 0
+#define DEFAULT_CONFIG_BVAR_OS 0
+#define DEFAULT_CONFIG_AVA_GAIN 0x400000
+#define DEFAULT_CONFIG_BVA_GAIN 0x400000
+#define DEFAULT_CONFIG_AVA_OS 0
+#define DEFAULT_CONFIG_BVA_OS 0
+#define DEFAULT_CONFIG_PHCAL_A 0
+#define DEFAULT_CONFIG_PHCAL_B 0
+
+// IRQSTATA / RSTIRQSTATA Register Bit Positions (Table 23, ADE7953 Datasheet)
+#define IRQSTATA_AEHFA_BIT         0  // Active energy register half full (Current Channel A)
+#define IRQSTATA_VAREHFA_BIT       1  // Reactive energy register half full (Current Channel A)
+#define IRQSTATA_VAEHFA_BIT        2  // Apparent energy register half full (Current Channel A)
+#define IRQSTATA_AEOFA_BIT         3  // Active energy register overflow/underflow (Current Channel A)
+#define IRQSTATA_VAREOFA_BIT       4  // Reactive energy register overflow/underflow (Current Channel A)
+#define IRQSTATA_VAEOFA_BIT        5  // Apparent energy register overflow/underflow (Current Channel A)
+#define IRQSTATA_AP_NOLOADA_BIT    6  // Active power no-load detected (Current Channel A)
+#define IRQSTATA_VAR_NOLOADA_BIT   7  // Reactive power no-load detected (Current Channel A)
+#define IRQSTATA_VA_NOLOADA_BIT    8  // Apparent power no-load detected (Current Channel A)
+#define IRQSTATA_APSIGN_A_BIT      9  // Sign of active energy changed (Current Channel A)
+#define IRQSTATA_VARSIGN_A_BIT     10 // Sign of reactive energy changed (Current Channel A)
+#define IRQSTATA_ZXTO_IA_BIT       11 // Zero crossing missing on Current Channel A
+#define IRQSTATA_ZXIA_BIT          12 // Current Channel A zero crossing detected
+#define IRQSTATA_OIA_BIT           13 // Current Channel A overcurrent threshold exceeded
+#define IRQSTATA_ZXTO_BIT          14 // Zero crossing missing on voltage channel
+#define IRQSTATA_ZXV_BIT           15 // Voltage channel zero crossing detected
+#define IRQSTATA_OV_BIT            16 // Voltage peak overvoltage threshold exceeded
+#define IRQSTATA_WSMP_BIT          17 // New waveform data acquired
+#define IRQSTATA_CYCEND_BIT        18 // End of line cycle accumulation period
+#define IRQSTATA_SAG_BIT           19 // Sag event occurred
+#define IRQSTATA_RESET_BIT         20 // End of software or hardware reset
+#define IRQSTATA_CRC_BIT           21 // Checksum has changed
+
+// Fixed conversion values
+// Validate values
+#define VALIDATE_VOLTAGE_MIN 50.0f
+#define VALIDATE_VOLTAGE_MAX 300.0f
+#define VALIDATE_CURRENT_MIN -300.0f
+#define VALIDATE_CURRENT_MAX 300.0f
+#define VALIDATE_POWER_MIN -100000.0f
+#define VALIDATE_POWER_MAX 100000.0f
+#define VALIDATE_POWER_FACTOR_MIN -1.0f
+#define VALIDATE_POWER_FACTOR_MAX 1.0f
+#define VALIDATE_GRID_FREQUENCY_MIN 45.0f
+#define VALIDATE_GRID_FREQUENCY_MAX 65.0f
+
+// Rounding values
+#define VOLTAGE_DECIMALS 1
+#define CURRENT_DECIMALS 3
+#define POWER_DECIMALS 1
+#define POWER_FACTOR_DECIMALS 3
+#define ENERGY_DECIMALS 1
+#define GRID_FREQUENCY_DECIMALS 3
+
+// Guardrails and thresholds
+#define MAXIMUM_POWER_FACTOR_CLAMP 1.10f // Values above 1 but below this are still accepted (rounding errors and similar). I noticed I still had a lot of spurious readings with PF around 1.06-1.07 (mainly close to fridge activations, probably due to the compressor)
+#define MINIMUM_CURRENT_RATIO_THREE_PHASE_NO_LOAD 0.0005f // 5/10000 of the CT rating: below this the three-phase approximation reads as no-load (the hardware no-load feature only covers the base-phase energy registers)
+#define MINIMUM_CURRENT_RATIO_VALIDATION 0.001f // 10/10000 of the CT rating: validation-discard gate - an electrically invalid reading at this current is a genuine failure worth logging
+#define MINIMUM_CURRENT_RATIO_CONDUCTING 0.0003f // 3/10000 of the CT rating: gate for the polarity-vote and WDRR-armed-boost path. Sits above the ADE7953 offset-noise floor (~0 A consistent-sign bias) yet below real small loads (~2 W on a 30 A CT = ~9 mA). Lower than MINIMUM_CURRENT_RATIO_VALIDATION so a reversed 2-3 W load still earns votes and the armed boost instead of reading a constant 0.
+#define MINIMUM_POWER_FACTOR 0.10f // Measuring such low power factors is virtually impossible with such CTs
+#define POLARITY_DETECT_VOTE_THRESHOLD 5 // Net consistent-sign votes (over conducting samples) needed to decide CT orientation. Magnitude-independent, so a steady -4 W reversed CT is caught like a -4 kW one
+#define POLARITY_DETECT_MAX_CONDUCTING_READS 40 // Give up CT-reversal detection after this many CONDUCTING reads without a decision (only trips on a sign-oscillating channel; a no-load channel waits indefinitely)
+#define ADE7953_MIN_LINECYC 10UL // Below this the readings are unstable (200 ms)
+#define ADE7953_MAX_LINECYC 1000UL // Above this too much time passes (20 seconds)
+#define INVALID_SPI_READ_WRITE 0xDEADDEAD // Custom, used to indicate an invalid SPI read/write operation
+
+// ADE7953 Smart Failure Detection
+#define ADE7953_MAX_FAILURES_BEFORE_RESTART 100
+#define ADE7953_FAILURE_RESET_TIMEOUT_MS (1 * 60 * 1000)
+
+// Polarity-mismatch evidence floor: a reading below the conduction gate still
+// counts as evidence when |active power| clearly exceeds the offset-noise band
+// (sign of a small but real load, e.g. 2.5 W at 24 mA). Random offset noise
+// cannot sustain a high clamped fraction at this magnitude.
+#define MISMATCH_EVIDENCE_MIN_POWER_W 1.0f
+
+// ADE7953 Critical Failure Detection (missed interrupts)
+#ifdef ENV_DEV
+#define ADE7953_MAX_CRITICAL_FAILURES_BEFORE_REBOOT (100 * 5) // 5x higher limit in dev environment
+#else
+#define ADE7953_MAX_CRITICAL_FAILURES_BEFORE_REBOOT (10 * 10)  // This cannot be too low as if we keep missing an interrupt we would reboot every few seconds
+#endif
+#define ADE7953_CRITICAL_FAILURE_RESET_TIMEOUT_MS (5 * 60 * 1000) // Reset counter after 5 minutes
+
+// Channel Preferences Keys
+#define CHANNEL_ACTIVE_KEY "active_%u" // Format: active_0 (9 chars)
+#define CHANNEL_REVERSE_KEY "reverse_%u" // Format: reverse_0 (10 chars)
+#define CHANNEL_LABEL_KEY "label_%u" // Format: label_0 (8 chars)
+#define CHANNEL_PHASE_KEY "phase_%u" // Format: phase_0 (9 chars)
+
+// Legacy key for migration (remove old NVS entries on load)
+#define CHANNEL_HIGHPRI_KEY_LEGACY "highpri_%u" // Format: highpri_0 (10 chars)
+
+// CT Specification keys
+#define CHANNEL_CT_CURRENT_RATING_KEY "ct_current_%u" // Format: ct_current_0 (12 chars)
+#define CHANNEL_CT_VOLTAGE_OUTPUT_KEY "ct_voltage_%u" // Format: ct_voltage_0 (12 chars)
+#define CHANNEL_CT_SCALING_FRACTION_KEY "ct_scaling_%u" // Format: ct_scaling_0 (12 chars)
+
+// Channel grouping keys
+#define CHANNEL_GROUP_LABEL_KEY "grp_label_%u" // Format: grp_label_0 (12 chars)
+
+// Channel role key
+#define CHANNEL_ROLE_KEY "role_%u" // Format: role_0 (7 chars)
+// Legacy role keys for migration
+#define CHANNEL_IS_GRID_KEY_LEGACY "is_grid_%u" // Format: is_grid_0 (10 chars)
+#define CHANNEL_IS_PRODUCTION_KEY_LEGACY "is_prod_%u" // Format: is_prod_0 (10 chars)
+#define CHANNEL_IS_BATTERY_KEY_LEGACY "is_batt_%u" // Format: is_batt_0 (10 chars)
+
+// Default channel values
+#define DEFAULT_CHANNEL_ACTIVE false
+#define DEFAULT_CHANNEL_0_ACTIVE true // Channel 0 must always be active
+#define DEFAULT_CHANNEL_REVERSE false
+#define DEFAULT_CHANNEL_PHASE PHASE_1
+#define DEFAULT_CHANNEL_LABEL_FORMAT "Channel %u"
+#define DEFAULT_CHANNEL_GROUP_LABEL_FORMAT "Group %u"
+
+// CT Specification defaults
+#define DEFAULT_CT_CURRENT_RATING 30.0f   // 30A
+#define DEFAULT_CT_VOLTAGE_OUTPUT 0.333f  // 333mV
+#define DEFAULT_CT_SCALING_FRACTION 0.0f  // No scaling by default
+
+#define BIT_8 8
+#define BIT_16 16
+#define BIT_24 24
+#define BIT_32 32
+
+#define INVALID_CHANNEL 255 // Invalid channel identifier, used to indicate no active channel
+
+// Enumeration for different types of ADE7953 interrupts
+enum class Ade7953InterruptType {
+  CYCEND,         // Line cycle end - normal meter reading
+  WSMP,           // Waveform sample ready - high-speed capture
+  RESET,          // Device reset detected
+  CRC_CHANGE,     // CRC register change detected
+  OTHER           // Other interrupts (SAG, etc.)
+};
+
+
+#include "phase_utils.h"  // Phase enum + PhaseUtils:: helpers (Arduino-free, host-testable)
+
+enum class Ade7953Channel{
+    A,
+    B,
+};
+
+inline const char* ADE7953_CHANNEL_TO_STRING(Ade7953Channel channel) {
+    switch (channel) {
+        case Ade7953Channel::A: return "A";
+        case Ade7953Channel::B: return "B";
+        default: return "Unknown";
+    }
+}
+
+// We don't have an enum for 16 channels since having them as unsigned int is more flexible
+
+enum class MeasurementType{
+    VOLTAGE,
+    CURRENT,
+    ACTIVE_POWER,
+    REACTIVE_POWER,
+    APPARENT_POWER,
+    POWER_FACTOR,
+};
+
+inline const char* MEASUREMENT_TYPE_TO_STRING(MeasurementType type) {
+    switch (type) {
+        case MeasurementType::VOLTAGE: return "Voltage";
+        case MeasurementType::CURRENT: return "Current";
+        case MeasurementType::ACTIVE_POWER: return "Active Power";
+        case MeasurementType::REACTIVE_POWER: return "Reactive Power";
+        case MeasurementType::APPARENT_POWER: return "Apparent Power";
+        case MeasurementType::POWER_FACTOR: return "Power Factor";
+        default: return "Unknown";
+    }
+}
+
+/*
+ * Struct to hold the real-time meter values for a specific channel
+  * Contains:
+  * - voltage: Voltage in Volts
+  * - current: Current in Amperes
+  * - activePower: Active power in Watts
+  * - reactivePower: Reactive power in VAR
+  * - apparentPower: Apparent power in VA
+  * - powerFactor: Power factor (-1 to 1, where negative values indicate capacitive load while positive values indicate inductive load)
+  * - activeEnergyImported: Active energy imported in Wh
+  * - activeEnergyExported: Active energy exported in Wh
+  * - reactiveEnergyImported: Reactive energy imported in VArh
+  * - reactiveEnergyExported: Reactive energy exported in VArh
+  * - apparentEnergy: Apparent energy in VAh (only absolute value)
+  * - lastUnixTimeMilliseconds: Last time the values were updated in milliseconds since epoch. Useful for absolute time tracking
+ */
+struct MeterValues
+{
+  float voltage;
+  float current;
+  float activePower;
+  float reactivePower;
+  float apparentPower;
+  float powerFactor;
+  double activeEnergyImported; // This made me go crazy - must be double instead of float to avoid precision issues over time with large energy values
+  double activeEnergyExported;
+  double reactiveEnergyImported;
+  double reactiveEnergyExported;
+  double apparentEnergy;
+  uint64_t lastUnixTimeMilliseconds;
+  uint64_t lastMillis; 
+
+  MeterValues()
+    : voltage(230.0), current(0.0f), activePower(0.0f), reactivePower(0.0f), apparentPower(0.0f), powerFactor(0.0f),
+      activeEnergyImported(0.0), activeEnergyExported(0.0), reactiveEnergyImported(0.0), 
+      reactiveEnergyExported(0.0), apparentEnergy(0.0), lastUnixTimeMilliseconds(0), lastMillis(0) {}
+};
+
+struct EnergyValues // Simpler structure for optimizing energy saved to storage
+{
+  double activeEnergyImported;
+  double activeEnergyExported;
+  double reactiveEnergyImported;
+  double reactiveEnergyExported;
+  double apparentEnergy;
+  uint64_t lastUnixTimeMilliseconds; // Last time the values were updated in milliseconds since epoch
+
+  EnergyValues()
+    : activeEnergyImported(0.0), activeEnergyExported(0.0), reactiveEnergyImported(0.0),
+      reactiveEnergyExported(0.0), apparentEnergy(0.0), lastUnixTimeMilliseconds(0) {}
+};
+
+struct CtSpecification
+{
+  float currentRating;                    // e.g., 30.0 for 30A CT
+  float voltageOutput;                    // e.g., 0.333 for 333mV or 1.0 for 1V  
+  float scalingFraction;                  // -0.5 to +0.5 for ±50% adjustment
+  
+  // Computed at runtime - no need to store these in Preferences
+  float aLsb;
+  // float wLsb;
+  // float varLsb;
+  // float vaLsb;
+  float whLsb;
+  float varhLsb;
+  float vahLsb;
+
+  CtSpecification()
+    : currentRating(DEFAULT_CT_CURRENT_RATING),
+      voltageOutput(DEFAULT_CT_VOLTAGE_OUTPUT),
+      scalingFraction(DEFAULT_CT_SCALING_FRACTION),
+      aLsb(1.0f), 
+      // wLsb(1.0f), varLsb(1.0f), vaLsb(1.0f),
+      whLsb(1.0f), varhLsb(1.0f), vahLsb(1.0f) {}
+};
+
+// ChannelRole and its DEFAULT_CHANNEL_*_ROLE defaults live in channel_types.h
+// (included above) so the host-testable meter_logic library can use them without
+// pulling in Arduino.
+
+struct ChannelData
+{
+  uint8_t index;
+  bool active;
+  bool reverse;
+  char label[NAME_BUFFER_SIZE];
+  Phase phase;
+  CtSpecification ctSpecification;
+
+  // Channel grouping (for 3-phase aggregation)
+  char groupLabel[NAME_BUFFER_SIZE];  // Label for the group (shared by channels in same group)
+
+  // Channel role
+  ChannelRole role;
+
+  // Transient runtime flags (NOT persisted to NVS, NOT exported to JSON).
+  // Set on inactive->active transition (and on role change for the polarity check).
+  // Used by the scheduler / meter task to give a freshly activated channel a
+  // single priority slot and to auto-detect a reversed CT clamp on the first
+  // meaningful reading.
+  bool _pendingPriorityRead;
+  bool _pendingPolarityCheck;
+
+  ChannelData()
+    : index(0),
+      active(false),
+      reverse(false),
+      phase(PHASE_1),
+      ctSpecification(CtSpecification()),
+      role(DEFAULT_CHANNEL_ROLE),
+      _pendingPriorityRead(false),
+      _pendingPolarityCheck(false)
+    {
+      snprintf(label, sizeof(label), "Channel");
+      snprintf(groupLabel, sizeof(groupLabel), DEFAULT_CHANNEL_GROUP_LABEL_FORMAT, 0);
+    }
+
+  ChannelData(uint8_t idx)
+    : index(idx),
+      active(idx == 0 ? DEFAULT_CHANNEL_0_ACTIVE : DEFAULT_CHANNEL_ACTIVE),
+      reverse(DEFAULT_CHANNEL_REVERSE),
+      phase(DEFAULT_CHANNEL_PHASE),
+      ctSpecification(CtSpecification()),
+      role(idx == 0 ? DEFAULT_CHANNEL_0_ROLE : DEFAULT_CHANNEL_ROLE),
+      _pendingPriorityRead(false),
+      _pendingPolarityCheck(false)
+    {
+      snprintf(label, sizeof(label), DEFAULT_CHANNEL_LABEL_FORMAT, idx);
+      snprintf(groupLabel, sizeof(groupLabel), DEFAULT_CHANNEL_GROUP_LABEL_FORMAT, idx);
+    }
+};
+
+// Per-channel runtime facts for the issue registry (issue #145). All values are
+// RAM-only and monotonic within the current boot; the single writer is the meter
+// task and readers rely on 32-bit loads being atomic on the ESP32-S3.
+struct ChannelIssueFacts
+{
+  uint32_t evidenceReads;        // readings carrying polarity evidence since boot: conducting OR |P| >= MISMATCH_EVIDENCE_MIN_POWER_W (pre-clamp)
+  uint32_t clampedEvidenceReads; // evidence readings zeroed by the LOAD/PV negative clamp
+  uint32_t polarityFlipCount;    // CT auto-detection flips since boot
+
+  ChannelIssueFacts() : evidenceReads(0), clampedEvidenceReads(0), polarityFlipCount(0) {}
+};
+
+// ADE7953 Configuration structure
+struct Ade7953Configuration
+{
+  int32_t aVGain;
+  int32_t aIGain;
+  int32_t bIGain;
+  int32_t aIRmsOs;
+  int32_t bIRmsOs;
+  int32_t aWGain;
+  int32_t bWGain;
+  int32_t aWattOs;
+  int32_t bWattOs;
+  int32_t aVarGain;
+  int32_t bVarGain;
+  int32_t aVarOs;
+  int32_t bVarOs;
+  int32_t aVaGain;
+  int32_t bVaGain;
+  int32_t aVaOs;
+  int32_t bVaOs;
+  int32_t phCalA;
+  int32_t phCalB;
+
+  Ade7953Configuration()
+    : aVGain(DEFAULT_CONFIG_AV_GAIN), aIGain(DEFAULT_CONFIG_AI_GAIN), bIGain(DEFAULT_CONFIG_BI_GAIN),
+      aIRmsOs(DEFAULT_CONFIG_AIRMS_OS), bIRmsOs(DEFAULT_CONFIG_BIRMS_OS),
+      aWGain(DEFAULT_CONFIG_AW_GAIN), bWGain(DEFAULT_CONFIG_BW_GAIN),
+      aWattOs(DEFAULT_CONFIG_AWATT_OS), bWattOs(DEFAULT_CONFIG_BWATT_OS),
+      aVarGain(DEFAULT_CONFIG_AVAR_GAIN), bVarGain(DEFAULT_CONFIG_BVAR_GAIN),
+      aVarOs(DEFAULT_CONFIG_AVAR_OS), bVarOs(DEFAULT_CONFIG_BVAR_OS),
+      aVaGain(DEFAULT_CONFIG_AVA_GAIN), bVaGain(DEFAULT_CONFIG_BVA_GAIN),
+      aVaOs(DEFAULT_CONFIG_AVA_OS), bVaOs(DEFAULT_CONFIG_BVA_OS),
+      phCalA(DEFAULT_CONFIG_PHCAL_A), phCalB(DEFAULT_CONFIG_PHCAL_B) {}
+};
+
+namespace Ade7953
+{
+    // Waveform capture state machine
+    enum class CaptureState {
+        IDLE,       // Not capturing and not requested
+        ARMED,      // Requested, waiting for the correct channel to come up in the cycle
+        CAPTURING,  // High-frequency sampling is in progress
+        COMPLETE,   // Capture is finished and data is ready for retrieval
+        ERROR       // An error occurred (e.g., buffer allocation failed)
+    };
+
+    // Core lifecycle management
+    bool begin(
+        uint8_t ssPin,
+        uint8_t sckPin,
+        uint8_t misoPin,
+        uint8_t mosiPin,
+        uint8_t resetPin,
+        uint8_t interruptPin);
+    bool _initializeAde7953(bool &retFlag);
+    void stop();
+
+
+    // Register operations
+    /**
+     * Reads the value from a register in the ADE7953 energy meter.
+     * 
+     * @param registerAddress The address of the register to read from. Expected range: 0 to 65535
+     * @param numBits The number of bits to read from the register. Expected values: 8, 16, 24 or 32.
+     * @param isSignedData Flag indicating whether the data is signed (true) or unsigned (false).
+     * @param isVerificationRequired Flag indicating whether to verify the last communication.
+     * @return The value read from the register.
+     */
+    int32_t readRegister(uint16_t registerAddress, uint8_t nBits, bool signedData, bool isVerificationRequired = true);
+    /**
+     * Writes data to a register in the ADE7953 energy meter.
+     * 
+     * @param registerAddress The address of the register to write to. (16-bit value)
+     * @param nBits The number of bits in the register. (8, 16, 24, or 32)
+     * @param data The data to write to the register. (nBits-bit value)
+     * @param isVerificationRequired Flag indicating whether to verify the last communication.
+     */
+    void writeRegister(uint16_t registerAddress, uint8_t nBits, int32_t data, bool isVerificationRequired = true);
+
+    // Task control
+    void pauseTasks();
+    void resumeTasks();
+
+    // Configuration management
+    void getConfiguration(Ade7953Configuration &config);
+    bool setConfiguration(const Ade7953Configuration &config);
+    void resetConfiguration();
+
+    // Configuration management - JSON operations
+    void getConfigurationAsJson(JsonDocument &jsonDocument);
+    bool setConfigurationFromJson(const JsonDocument &jsonDocument, bool partial = false);
+    void configurationToJson(const Ade7953Configuration &config, JsonDocument &jsonDocument);
+    bool configurationFromJson(const JsonDocument &jsonDocument, Ade7953Configuration &config, bool partial = false);
+
+    // Sample time management
+    uint64_t getSampleTime();
+    bool setSampleTime(uint64_t sampleTime);
+
+    // Channel data management
+    bool isChannelActive(uint8_t channelIndex);
+    bool hasChannelValidMeasurements(uint8_t channelIndex);
+    void getChannelLabel(uint8_t channelIndex, char* buffer, size_t bufferSize); // No need for bool return, fallback is the default constructor value if getChannelData failed
+    bool getChannelData(ChannelData &channelData, uint8_t channelIndex);
+    bool setChannelData(const ChannelData &channelData, uint8_t channelIndex, bool* roleChanged = nullptr, bool armTransients = true);
+    void resetChannelData(uint8_t channelIndex);
+
+    // Channel data management - JSON operations
+    bool getChannelDataAsJson(JsonDocument &jsonDocument, uint8_t channelIndex);
+    bool getAllChannelDataAsJson(JsonDocument &jsonDocument);
+    bool setChannelDataFromJson(const JsonDocument &jsonDocument, bool partial = false, bool* roleChanged = nullptr);
+    void channelDataToJson(const ChannelData &channelData, JsonDocument &jsonDocument);
+    void channelDataFromJson(const JsonDocument &jsonDocument, ChannelData &channelData, bool partial = false);
+
+    // Channel data cache helpers
+    uint32_t computeAllChannelDataHash(); // Compute CRC32 hash of all channel data for ETag caching
+
+    // Channel role helpers
+    ChannelRole getChannelRole(uint8_t channelIndex);
+    const char* channelRoleToString(ChannelRole role);
+    ChannelRole channelRoleFromString(const char* roleStr);
+    bool isValidChannelRoleString(const char* roleStr);
+
+    // Energy data management
+    void resetEnergyValues();
+    void resetChannelEnergyValues(uint8_t channelIndex); // Resets energy counters and clears historical CSV data for a single channel
+    bool setEnergyValues(
+        uint8_t channelIndex,
+        double activeEnergyImported,
+        double activeEnergyExported,
+        double reactiveEnergyImported,
+        double reactiveEnergyExported,
+        double apparentEnergy
+    );
+
+    // Data output
+    bool singleMeterValuesToJson(JsonDocument &jsonDocument, uint8_t channelIndex);
+    bool fullMeterValuesToJson(JsonDocument &jsonDocument);
+    bool getMeterValues(MeterValues &meterValues, uint8_t channelIndex);
+
+    // Role-based aggregated values
+    float getAggregatedActivePowerByRole(ChannelRole role);
+    float getAggregatedReactivePowerByRole(ChannelRole role);
+    float getAggregatedApparentPowerByRole(ChannelRole role);
+    float getAggregatedPowerFactorByRole(ChannelRole role);
+    float getAggregatedActiveEnergyImportedByRole(ChannelRole role);
+    float getAggregatedActiveEnergyExportedByRole(ChannelRole role);
+    float getAggregatedReactiveEnergyImportedByRole(ChannelRole role);
+    float getAggregatedReactiveEnergyExportedByRole(ChannelRole role);
+    float getAggregatedApparentEnergyByRole(ChannelRole role);
+
+    // Grid frequency
+    float getGridFrequency();
+
+    // Issue registry facts (RAM-only, safe to call cross-task)
+    bool getChannelIssueFacts(uint8_t channelIndex, ChannelIssueFacts &facts);
+
+    // Task information
+    TaskInfo getMeterReadingTaskInfo();
+    TaskInfo getEnergySaveTaskInfo();
+    TaskInfo getHourlyCsvTaskInfo();
+
+    // Waveform capture API
+    bool startWaveformCapture(uint8_t channelIndex);
+    uint8_t getWaveformCaptureChannel();
+    CaptureState getWaveformCaptureStatus();
+    uint16_t getWaveformCaptureData(int32_t* vBuffer, int32_t* iBuffer, uint64_t* microsBuffer, uint16_t bufferSize);
+    bool getWaveformCaptureAsJson(JsonDocument& jsonDocument);
+};
